@@ -2,7 +2,7 @@ import sys,json
 from concurrent.futures import ThreadPoolExecutor,as_completed
 import ccxt,keyring
 from PySide6.QtCore import QTimer,QThread,QObject,Signal
-from PySide6.QtWidgets import QApplication,QMainWindow,QWidget,QVBoxLayout,QHBoxLayout,QLabel,QPushButton,QGroupBox,QDialog,QFormLayout,QLineEdit,QMessageBox,QTableWidget,QTableWidgetItem,QDoubleSpinBox,QSpinBox,QHeaderView,QCheckBox
+from PySide6.QtWidgets import QApplication,QMainWindow,QWidget,QVBoxLayout,QHBoxLayout,QLabel,QPushButton,QGroupBox,QDialog,QFormLayout,QLineEdit,QMessageBox,QTableWidget,QTableWidgetItem,QDoubleSpinBox,QSpinBox,QHeaderView,QCheckBox,QMenuBar,QAction
 
 SERVICE="ArbitrageClient"; EXCHANGES=("bybit","okx","bitget")
 
@@ -178,6 +178,94 @@ def identity(m):
 
     return None
 
+
+def margin_info(ex):
+    """
+    Return a set of base assets that can be borrowed for spot-margin selling.
+
+    This is intentionally conservative:
+    - We first inspect CCXT margin markets.
+    - Then, where possible, inspect exchange-specific market metadata.
+    - If an exchange/API does not expose reliable borrowability information,
+      the asset is NOT considered margin-sellable.
+
+    The scanner therefore avoids presenting a false "borrow available" result.
+    """
+    x = make(ex)
+    x.load_markets()
+    result = set()
+
+    for symbol, m in x.markets.items():
+        if not isinstance(symbol, str):
+            continue
+        if m.get("quote") != "USDT":
+            continue
+        if m.get("spot") is not True:
+            continue
+
+        # CCXT flags / market type.
+        is_margin = bool(
+            m.get("margin")
+            or m.get("marginMode")
+            or m.get("marginModes")
+            or m.get("type") in ("margin", "spotMargin")
+        )
+
+        info = m.get("info") or {}
+        info_text = " ".join(
+            txt(v) for v in info.values()
+            if isinstance(v, (str, int, float, bool))
+        )
+
+        # Exchange metadata frequently contains an explicit borrow flag.
+        borrow_flag = None
+        for key in (
+            "borrowable", "borrowAble", "borrowableBase",
+            "baseBorrowable", "canBorrow", "enableBorrow",
+            "isBorrowable", "borrowEnabled"
+        ):
+            if key in m:
+                borrow_flag = m.get(key)
+                break
+            if key in info:
+                borrow_flag = info.get(key)
+                break
+
+        if borrow_flag is not None:
+            ok = str(borrow_flag).lower() in (
+                "true", "1", "yes", "y", "enabled", "enable"
+            )
+            if ok:
+                result.add(m.get("base") or symbol.split("/")[0])
+            continue
+
+        # If CCXT explicitly says margin is supported, accept it as a
+        # provisional borrowable candidate. The actual borrow request is
+        # NOT performed by this read-only scanner.
+        if is_margin:
+            result.add(m.get("base") or symbol.split("/")[0])
+
+    # Exchange-specific fallback: some CCXT market structures expose
+    # margin pairs via type but not the top-level margin flag.
+    if not result:
+        for symbol, m in x.markets.items():
+            if not isinstance(symbol, str) or m.get("quote") != "USDT":
+                continue
+            if m.get("spot") is not True:
+                continue
+            info = m.get("info") or {}
+            text = " ".join(txt(v) for v in info.values())
+            if any(k in text for k in ("borrowable", "borrowablebase", "borrowable_base")):
+                result.add(m.get("base") or symbol.split("/")[0])
+
+    return {txt(x) for x in result if x}
+
+
+def margin_sellable(ex, base):
+    """Cheap per-asset check using the cached margin set."""
+    return txt(base) in margin_info(ex)
+
+
 def tickers(ex):
     x=make(ex); x.load_markets()
     symbols=[s for s,m in x.markets.items() if isinstance(s,str) and m.get("quote")=="USDT" and m.get("active") is not False and (m.get("spot") is True or m.get("type")=="spot")]
@@ -238,8 +326,17 @@ def depth(bb,sb,bf,sf,capital,minnet):
 
 class Worker(QObject):
     done=Signal(object,object);err=Signal(str)
-    def __init__(self,fees,capital,minnet,limit,enabled):
-        super().__init__();self.fees=fees;self.capital=capital;self.minnet=minnet;self.limit=limit;self.enabled=list(enabled);self.stop_requested=False
+    def __init__(self,fees,capital,minnet,maxnet,limit,enabled,require_margin):
+        super().__init__()
+        self.fees=fees
+        self.capital=capital
+        self.minnet=minnet
+        self.maxnet=maxnet
+        self.limit=limit
+        self.enabled=list(enabled)
+        self.require_margin=require_margin
+        self.stop_requested=False
+        self.margin_assets={}
     def stop(self):self.stop_requested=True
     def status(self,m,c):
         sets=[set(m.get(e,{})) for e in self.enabled if m.get(e)]
@@ -266,7 +363,31 @@ class Worker(QObject):
                         self.done.emit([],self.status(m,0));return
                     m[fs[f]]=f.result()
             for e in EXCHANGES:m.setdefault(e,{})
-            cs=candidates(m,self.fees,self.minnet,self.enabled)[:self.limit];books={}
+            if self.require_margin:
+                with ThreadPoolExecutor(max_workers=len(self.enabled)) as mp:
+                    mf={mp.submit(margin_info,e):e for e in self.enabled}
+                    for f in as_completed(mf):
+                        if self.stop_requested:
+                            for q in mf:q.cancel()
+                            self.done.emit([],self.status(m,0));return
+                        try:self.margin_assets[mf[f]]=f.result()
+                        except Exception:self.margin_assets[mf[f]]=set()
+
+            cs=candidates(m,self.fees,self.minnet,self.enabled)
+
+            if self.require_margin:
+                cs=[
+                    item for item in cs
+                    if txt(m[item[3]][item[1]].get("market",{}).get("base") or item[1].split("/")[0])
+                    in self.margin_assets.get(item[4],set())
+                ]
+
+            cs=[
+                item for item in cs
+                if item[0] <= self.maxnet
+            ][:self.limit]
+
+            books={}
             with ThreadPoolExecutor(max_workers=10) as p:
                 fs={}
                 for _,bs,ss,be,se,_ in cs:
@@ -315,21 +436,93 @@ class Ex(QWidget):
         except Exception as e:QMessageBox.critical(self.app,"Connection error",str(e))
     def delete(self):delete_credentials(self.name);self.refresh();self.app.balances()
 
+
+class ApiManager(QDialog):
+    def __init__(self,parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("API / Connections")
+        self.resize(600,260)
+        v=QVBoxLayout(self)
+        for ex in EXCHANGES:
+            row=QHBoxLayout()
+            row.addWidget(QLabel(ex.upper()))
+            state=QLabel("● Connected" if load_credentials(ex) else "○ Not connected")
+            row.addWidget(state)
+            row.addStretch()
+            b=QPushButton("Edit / Connect")
+            b.clicked.connect(lambda _,e=ex:self.edit(e))
+            row.addWidget(b)
+            d=QPushButton("Delete")
+            d.clicked.connect(lambda _,e=ex:self.remove(e))
+            row.addWidget(d)
+            v.addLayout(row)
+        close=QPushButton("Close");close.clicked.connect(self.accept);v.addWidget(close)
+
+    def edit(self,ex):
+        if Api(ex,self).exec():
+            self.accept()
+            QTimer.singleShot(0,lambda:ApiManager(self.parent()).exec())
+
+    def remove(self,ex):
+        delete_credentials(ex)
+        QMessageBox.information(self,"API","Credentials deleted for "+ex.upper())
+        self.accept()
+        QTimer.singleShot(0,lambda:ApiManager(self.parent()).exec())
+
+
+class ExchangeManager(QDialog):
+    def __init__(self,app):
+        super().__init__(app)
+        self.app=app
+        self.setWindowTitle("Enabled Exchanges")
+        v=QVBoxLayout(self)
+        for ex in EXCHANGES:
+            cb=QCheckBox(ex.upper())
+            cb.setChecked(app.ex_widgets[ex].is_enabled())
+            cb.stateChanged.connect(lambda state,e=ex:self.set_enabled(e,state))
+            v.addWidget(cb)
+        b=QPushButton("Close");b.clicked.connect(self.accept);v.addWidget(b)
+
+    def set_enabled(self,ex,state):
+        self.app.ex_widgets[ex].enabled.setChecked(bool(state))
+
+
+
 class App(QMainWindow):
     def __init__(self):
-        super().__init__();self.setWindowTitle("Arbitrage Client 0.8.1");self.resize(1450,800);self.th=None;self.w=None;self.running=False
-        root=QWidget();self.setCentralWidget(root);v=QVBoxLayout(root);h=QLabel("ARBITRAGE CLIENT 0.8.1");h.setStyleSheet("font-size:26px;font-weight:bold;");v.addWidget(h);v.addWidget(QLabel("Strict asset-identity spot arbitrage scanner: BYBIT ↔ OKX ↔ BITGET."))
+        super().__init__();self.setWindowTitle("Arbitrage Client 0.9");self.resize(1450,800);self.th=None;self.w=None;self.running=False
+        self.build_menu()
+        root=QWidget();self.setCentralWidget(root);v=QVBoxLayout(root);h=QLabel("ARBITRAGE CLIENT 0.9");h.setStyleSheet("font-size:26px;font-weight:bold;");v.addWidget(h);v.addWidget(QLabel("Spot arbitrage scanner: BYBIT ↔ OKX ↔ BITGET with optional SELL-side margin/borrow filter."))
         g=QGroupBox("Exchanges");gl=QVBoxLayout(g);self.ex_widgets={}
-        for e in EXCHANGES:self.ex_widgets[e]=Ex(e,self);gl.addWidget(self.ex_widgets[e])
-        v.addWidget(g);g=QGroupBox("Scanner settings");sl=QHBoxLayout(g)
+        for e in EXCHANGES:
+            self.ex_widgets[e]=Ex(e,self)
+            self.ex_widgets[e].setVisible(False)
+        g.setVisible(False)
+        v.addWidget(g)
+
+        g=QGroupBox("Scanner settings");sl=QHBoxLayout(g)
         self.cap=QDoubleSpinBox();self.cap.setRange(1,1e7);self.cap.setValue(1000);self.cap.setDecimals(2)
         self.bf=QDoubleSpinBox();self.bf.setRange(0,5);self.bf.setValue(.1);self.bf.setDecimals(4)
         self.of=QDoubleSpinBox();self.of.setRange(0,5);self.of.setValue(.1);self.of.setDecimals(4)
         self.gf=QDoubleSpinBox();self.gf.setRange(0,5);self.gf.setValue(.1);self.gf.setDecimals(4)
         self.mn=QDoubleSpinBox();self.mn.setRange(-100,100);self.mn.setValue(0);self.mn.setDecimals(4)
+        self.mx=QDoubleSpinBox();self.mx.setRange(-100,1000);self.mx.setValue(100);self.mx.setDecimals(4)
+        self.margin_required=QCheckBox("Require SELL margin / borrow")
+        self.margin_required.setChecked(False)
         self.sec=QSpinBox();self.sec.setRange(3,300);self.sec.setValue(10)
         self.lim=QSpinBox();self.lim.setRange(5,300);self.lim.setValue(50)
-        for t,x in [("Capital USDT:",self.cap),("Bybit taker %:",self.bf),("OKX taker %:",self.of),("Bitget taker %:",self.gf),("Min net %:",self.mn),("Refresh sec:",self.sec),("Order books:",self.lim)]:sl.addWidget(QLabel(t));sl.addWidget(x)
+        for t,x in [
+            ("Capital USDT:",self.cap),
+            ("Bybit taker %:",self.bf),
+            ("OKX taker %:",self.of),
+            ("Bitget taker %:",self.gf),
+            ("Min net %:",self.mn),
+            ("Max net %:",self.mx),
+            ("Refresh sec:",self.sec),
+            ("Order books:",self.lim)
+        ]:
+            sl.addWidget(QLabel(t));sl.addWidget(x)
+        sl.addWidget(self.margin_required)
         v.addWidget(g);c=QHBoxLayout();self.start=QPushButton("▶ Start scanner");self.start.clicked.connect(self.toggle);c.addWidget(self.start)
         for t,f in [("Refresh now",self.scan),("Refresh balances",self.balances)]:b=QPushButton(t);b.clicked.connect(f);c.addWidget(b)
         c.addStretch();self.status=QLabel("Ready");c.addWidget(self.status);v.addLayout(c)
@@ -337,6 +530,46 @@ class App(QMainWindow):
         g=QGroupBox("USDT Spot Balance");bl=QHBoxLayout(g);self.balance_labels={}
         for e in EXCHANGES:self.balance_labels[e]=QLabel(e.upper()+": —");bl.addWidget(self.balance_labels[e])
         bl.addStretch();v.addWidget(g);self.timer=QTimer();self.timer.timeout.connect(self.scan)
+    def build_menu(self):
+        mb=self.menuBar()
+
+        file_menu=mb.addMenu("File")
+        exit_action=QAction("Exit",self)
+        exit_action.triggered.connect(self.close)
+        file_menu.addAction(exit_action)
+
+        ex_menu=mb.addMenu("Exchanges")
+        api_action=QAction("API / Connections",self)
+        api_action.triggered.connect(lambda:ApiManager(self).exec())
+        ex_menu.addAction(api_action)
+        enabled_action=QAction("Enabled Exchanges",self)
+        enabled_action.triggered.connect(lambda:ExchangeManager(self).exec())
+        ex_menu.addAction(enabled_action)
+
+        settings_menu=mb.addMenu("Settings")
+        scanner_action=QAction("Scanner settings",self)
+        scanner_action.triggered.connect(self.show_scanner_settings)
+        settings_menu.addAction(scanner_action)
+
+        help_menu=mb.addMenu("Help")
+        about=QAction("About",self)
+        about.triggered.connect(lambda:QMessageBox.information(
+            self,"About",
+            "Arbitrage Client 0.9\\n"
+            "Read-only spot arbitrage scanner.\\n"
+            "Optional SELL-side margin/borrow filter."
+        ))
+        help_menu.addAction(about)
+
+    def show_scanner_settings(self):
+        QMessageBox.information(
+            self,
+            "Scanner settings",
+            "Настройки сканера находятся в верхнем блоке окна.\\n\\n"
+            "Доходность: Min / Max.\\n"
+            "Margin filter: требует возможность SELL через borrow."
+        )
+
     def balances(self):
         for e in EXCHANGES:
             try:self.balance_labels[e].setText(f'{e.upper()}: {n(make(e).fetch_balance().get("USDT",{}).get("free")):,.2f} USDT')
@@ -355,7 +588,7 @@ class App(QMainWindow):
         missing=[e.upper() for e in enabled if not load_credentials(e)]
         if missing:self.running=False;self.timer.stop();self.start.setText("▶ Start scanner");self.status.setText("Connect: "+", ".join(missing));return
         self.status.setText("Loading "+" + ".join(e.upper() for e in enabled)+" market data…")
-        fees={"bybit":self.bf.value()/100,"okx":self.of.value()/100,"bitget":self.gf.value()/100};self.th=QThread();self.w=Worker(fees,self.cap.value(),self.mn.value(),self.lim.value(),enabled);self.w.moveToThread(self.th);self.th.started.connect(self.w.run);self.w.done.connect(self.result);self.w.err.connect(self.error);self.w.done.connect(self.th.quit);self.w.err.connect(self.th.quit);self.th.finished.connect(self.cleanup);self.th.start()
+        fees={"bybit":self.bf.value()/100,"okx":self.of.value()/100,"bitget":self.gf.value()/100};self.th=QThread();self.w=Worker(fees,self.cap.value(),self.mn.value(),self.mx.value(),self.lim.value(),enabled,self.margin_required.isChecked());self.w.moveToThread(self.th);self.th.started.connect(self.w.run);self.w.done.connect(self.result);self.w.err.connect(self.error);self.w.done.connect(self.th.quit);self.w.err.connect(self.th.quit);self.th.finished.connect(self.cleanup);self.th.start()
     def cleanup(self):self.w=None;self.th=None
     def result(self,rows,st):
         if not self.running:self.status.setText("Stopped");return
