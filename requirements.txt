@@ -1,3 +1,3 @@
-PySide6
-ccxt
-keyring
+PySide6>=6.7
+ccxt>=4.4
+keyring>=25.0
