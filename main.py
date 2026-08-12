@@ -1,4 +1,4 @@
-# Arbitrage Client 0.5
+# Arbitrage Client 0.6
 # Read-only spot arbitrage scanner: Bybit <-> OKX <-> Bitget.
 # Uses CCXT and real order-book depth. No orders are placed.
 
@@ -77,20 +77,45 @@ def tickers(ex):
     x = make(ex)
     x.load_markets()
 
+    # Bitget's spot API returns spot symbols as BTCUSDT/ETHUSDT etc.
+    # CCXT maps them to unified symbols such as BTC/USDT. Some CCXT
+    # versions do not populate market["spot"] consistently for Bitget,
+    # so do not rely on spot == True alone.
+    symbols = []
+    for s, m in x.markets.items():
+        if not isinstance(s, str):
+            continue
+        if m.get("quote") != "USDT":
+            continue
+        if m.get("active") is False:
+            continue
+        if m.get("spot") is True or m.get("type") == "spot":
+            symbols.append(s)
+
     if ex == "bybit":
-        d = x.fetch_tickers(params={"category": "spot"})
+        d = x.fetch_tickers(symbols, params={"category": "spot"})
+    elif ex == "bitget":
+        # Explicitly request the spot markets. This avoids Bitget returning
+        # an empty/filtered result when the exchange has multiple market
+        # types available.
+        d = x.fetch_tickers(symbols)
     else:
-        d = x.fetch_tickers()
+        d = x.fetch_tickers(symbols)
 
     out = {}
-    items = d.items() if hasattr(d, "items") else []
 
-    for s, t in items:
-        if not isinstance(s, str) or not s.endswith("/USDT") or s not in x.markets:
+    for s, t in (d.items() if hasattr(d, "items") else []):
+        if s not in x.markets:
             continue
 
         m = x.markets[s]
-        if m.get("active") is False or m.get("spot") is not True:
+
+        # Final safety check: only real USDT spot markets.
+        if m.get("quote") != "USDT":
+            continue
+        if m.get("active") is False:
+            continue
+        if not (m.get("spot") is True or m.get("type") == "spot"):
             continue
 
         bid = n(t.get("bid")) if isinstance(t, dict) else 0
@@ -99,6 +124,20 @@ def tickers(ex):
         if bid > 0 and ask > 0:
             out[s] = {"bid": bid, "ask": ask}
 
+    # If Bitget's CCXT adapter returned no unified tickers, use individual
+    # ticker requests as a fallback for the first spot symbols. This makes
+    # the diagnostic visible instead of silently showing "Bitget 0".
+    if ex == "bitget" and not out:
+        for s in symbols[:100]:
+            try:
+                t = x.fetch_ticker(s)
+                bid = n(t.get("bid"))
+                ask = n(t.get("ask"))
+                if bid > 0 and ask > 0:
+                    out[s] = {"bid": bid, "ask": ask}
+            except Exception:
+                continue
+
     return out
 
 
@@ -106,9 +145,14 @@ def book(ex, symbol):
     x = make(ex)
     x.load_markets()
 
+    if symbol not in x.markets:
+        raise RuntimeError(f"{ex.upper()}: market {symbol} not found")
+
     if ex == "bybit":
         return x.fetch_order_book(symbol, limit=50, params={"category": "spot"})
 
+    # Bitget uses the spot order-book endpoint through CCXT when the
+    # unified market is a spot market.
     return x.fetch_order_book(symbol, limit=50)
 
 
@@ -456,7 +500,7 @@ class App(QMainWindow):
     def __init__(self):
         super().__init__()
 
-        self.setWindowTitle("Arbitrage Client 0.5")
+        self.setWindowTitle("Arbitrage Client 0.6")
         self.resize(1450, 800)
 
         self.th = None
@@ -467,7 +511,7 @@ class App(QMainWindow):
         self.setCentralWidget(root)
         v = QVBoxLayout(root)
 
-        h = QLabel("ARBITRAGE CLIENT 0.5")
+        h = QLabel("ARBITRAGE CLIENT 0.6")
         h.setStyleSheet("font-size:26px;font-weight:bold;")
         v.addWidget(h)
 
