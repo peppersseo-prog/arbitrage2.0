@@ -26,32 +26,156 @@ def make(ex):
     return getattr(ccxt,ex)(cfg)
 
 def contract_ids(m):
-    if not isinstance(m,dict):return set()
-    info=m.get("info") or {}; out=set()
-    addrkeys=("contractAddress","contract_address","tokenAddress","token_address","address","contractAddr","tokenAddr")
-    netkeys=("network","chain","chainName","networkName","chainType","chainTypeName")
-    addrs=[]; nets=[]
-    for s in (m,info):
-        for k in addrkeys:
-            v=s.get(k)
-            if v not in (None,""):addrs.append(txt(v))
-        for k in netkeys:
-            v=s.get(k)
-            if v not in (None,""):nets.append(txt(v))
-    for a in addrs:
-        for net in (nets or [""]):out.add((net,a))
+    """Extract any contract/address information exposed by CCXT/exchange."""
+    if not isinstance(m, dict):
+        return set()
+
+    info = m.get("info") or {}
+    out = set()
+
+    addrkeys = (
+        "contractAddress", "contract_address",
+        "tokenAddress", "token_address",
+        "address", "contractAddr", "tokenAddr",
+        "contractAddressList", "contract_address_list",
+    )
+    netkeys = (
+        "network", "chain", "chainName", "networkName",
+        "chainType", "chainTypeName",
+    )
+
+    addresses = []
+    networks = []
+
+    for source in (m, info):
+        if not isinstance(source, dict):
+            continue
+
+        for key in addrkeys:
+            value = source.get(key)
+            if isinstance(value, list):
+                for item in value:
+                    if isinstance(item, dict):
+                        a = (
+                            item.get("contractAddress")
+                            or item.get("contract_address")
+                            or item.get("address")
+                            or item.get("tokenAddress")
+                        )
+                        net = (
+                            item.get("network")
+                            or item.get("chain")
+                            or item.get("chainName")
+                            or item.get("networkName")
+                        )
+                        if a:
+                            out.add((txt(net), txt(a)))
+                    elif value:
+                        addresses.append(txt(item))
+            elif value:
+                addresses.append(txt(value))
+
+        for key in netkeys:
+            value = source.get(key)
+            if isinstance(value, list):
+                networks.extend(txt(x) for x in value if x)
+            elif value:
+                networks.append(txt(value))
+
+    for address in addresses:
+        for network in (networks or [""]):
+            out.add((network, address))
+
     return out
 
+
+def identity_candidates(m):
+    """
+    Return several identity signals.
+
+    Strong signals:
+      - contract + network
+      - explicit asset/coin id
+
+    Medium signal:
+      - CCXT baseId + quote currency + spot type
+
+    Ticker alone is deliberately NOT enough.
+    """
+    if not isinstance(m, dict):
+        return set()
+
+    result = set()
+
+    for item in contract_ids(m):
+        result.add(("contract", item))
+
+    info = m.get("info") or {}
+
+    for source in (m, info):
+        if not isinstance(source, dict):
+            continue
+        for key in ("assetId", "asset_id", "coinId", "coin_id"):
+            value = source.get(key)
+            if value not in (None, ""):
+                result.add(("assetid", txt(value)))
+
+    base_id = m.get("baseId")
+    base = m.get("base")
+    quote = m.get("quote")
+    market_type = m.get("type")
+
+    # baseId is NOT enough by itself. It is only used as a fallback
+    # identity for conventional spot assets after excluding obvious
+    # synthetic/RWA/tokenized instruments.
+    info_text = " ".join(
+        txt(v) for v in info.values()
+        if isinstance(v, (str, int, float))
+    )
+
+    suspicious_words = (
+        "rwa", "stock", "equity", "share", "tokenized",
+        "synthetic", "prestock", "xstock", "fractional"
+    )
+
+    if base_id and base and quote == "USDT" and market_type == "spot":
+        if not any(word in info_text for word in suspicious_words):
+            result.add((
+                "base",
+                txt(base_id),
+                txt(quote),
+            ))
+
+    return result
+
+
 def identity(m):
-    if not isinstance(m,dict):return None
-    ids=contract_ids(m)
-    if ids:return ("contract",tuple(sorted(ids)))
-    info=m.get("info") or {}
-    for s in (m,info):
-        for k in ("assetId","asset_id","coinId","coin_id"):
-            v=s.get(k)
-            if v not in (None,""):return ("assetid",txt(v))
-    # Deliberately no ticker/baseId fallback.
+    """
+    Select the best available identity.
+
+    Important:
+    We no longer require a contract address for every asset.
+    This restores normal BTC/ETH/SOL-style matching while preventing
+    ticker-only matches such as unrelated XTER assets.
+    """
+    candidates = identity_candidates(m)
+
+    strong = sorted(
+        x for x in candidates
+        if x[0] in ("contract", "assetid")
+    )
+
+    if strong:
+        return ("strong", tuple(strong))
+
+    base = sorted(
+        x for x in candidates
+        if x[0] == "base"
+    )
+
+    if base:
+        return ("base", tuple(base))
+
     return None
 
 def tickers(ex):
@@ -119,7 +243,18 @@ class Worker(QObject):
     def stop(self):self.stop_requested=True
     def status(self,m,c):
         sets=[set(m.get(e,{})) for e in self.enabled if m.get(e)]
-        return {"bybit":len(m.get("bybit",{})),"okx":len(m.get("okx",{})),"bitget":len(m.get("bitget",{})),"common":len(set.intersection(*sets)) if len(sets)>=2 else 0,"checked":c}
+        return {
+            "bybit": len(m.get("bybit", {})),
+            "okx": len(m.get("okx", {})),
+            "bitget": len(m.get("bitget", {})),
+            "common": len(set.intersection(*sets)) if len(sets) >= 2 else 0,
+            "checked": c,
+            "identified": sum(
+                1 for ex in self.enabled
+                for d in m.get(ex, {}).values()
+                if d.get("identity") is not None
+            ),
+        }
     def run(self):
         m={}
         try:
@@ -182,8 +317,8 @@ class Ex(QWidget):
 
 class App(QMainWindow):
     def __init__(self):
-        super().__init__();self.setWindowTitle("Arbitrage Client 0.8");self.resize(1450,800);self.th=None;self.w=None;self.running=False
-        root=QWidget();self.setCentralWidget(root);v=QVBoxLayout(root);h=QLabel("ARBITRAGE CLIENT 0.8");h.setStyleSheet("font-size:26px;font-weight:bold;");v.addWidget(h);v.addWidget(QLabel("Strict asset-identity spot arbitrage scanner: BYBIT ↔ OKX ↔ BITGET."))
+        super().__init__();self.setWindowTitle("Arbitrage Client 0.8.1");self.resize(1450,800);self.th=None;self.w=None;self.running=False
+        root=QWidget();self.setCentralWidget(root);v=QVBoxLayout(root);h=QLabel("ARBITRAGE CLIENT 0.8.1");h.setStyleSheet("font-size:26px;font-weight:bold;");v.addWidget(h);v.addWidget(QLabel("Strict asset-identity spot arbitrage scanner: BYBIT ↔ OKX ↔ BITGET."))
         g=QGroupBox("Exchanges");gl=QVBoxLayout(g);self.ex_widgets={}
         for e in EXCHANGES:self.ex_widgets[e]=Ex(e,self);gl.addWidget(self.ex_widgets[e])
         v.addWidget(g);g=QGroupBox("Scanner settings");sl=QHBoxLayout(g)
@@ -228,7 +363,12 @@ class App(QMainWindow):
         for i,r in enumerate(rows):
             vals=[r["symbol"],r["sell_symbol"],r["buy"].upper(),r["sell"].upper(),f'{r["top_buy"]:,.8g}',f'{r["top_sell"]:,.8g}',f'{r["avg_buy"]:,.8g}',f'{r["avg_sell"]:,.8g}',f'{r["top_gross"]:.4f}%',f'{r["net"]:.4f}%',f'{r["qty"]:,.8g}',f'${r["cost"]:,.2f}',f'${r["profit"]:,.4f}',f'${r["fees"]:,.4f}']
             for j,x in enumerate(vals):self.tab.setItem(i,j,QTableWidgetItem(x))
-        self.status.setText(f'OK: Bybit {st["bybit"]} | OKX {st["okx"]} | Bitget {st["bitget"]} | common ticker {st["common"]} | identity checked {st["checked"]} | opportunities {len(rows)}')
+        self.status.setText(
+            f'OK: Bybit {st["bybit"]} | OKX {st["okx"]} | '
+            f'Bitget {st["bitget"]} | common ticker {st["common"]} | '
+            f'identified {st.get("identified", 0)} | '
+            f'candidates {st["checked"]} | opportunities {len(rows)}'
+        )
     def error(self,msg):
         if not self.running:self.status.setText("Stopped");return
         self.status.setText("Scanner error");QMessageBox.critical(self,"Scanner error","Не удалось получить данные.\n\n"+msg)
