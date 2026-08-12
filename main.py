@@ -2,6 +2,7 @@ import sys,json
 from concurrent.futures import ThreadPoolExecutor,as_completed
 import ccxt,keyring
 from PySide6.QtCore import QTimer,QThread,QObject,Signal
+from PySide6.QtGui import QAction
 from PySide6.QtWidgets import QApplication,QMainWindow,QWidget,QVBoxLayout,QHBoxLayout,QLabel,QPushButton,QGroupBox,QDialog,QFormLayout,QLineEdit,QMessageBox,QTableWidget,QTableWidgetItem,QDoubleSpinBox,QSpinBox,QHeaderView,QCheckBox,QMenuBar
 
 SERVICE="ArbitrageClient"; EXCHANGES=("bybit","okx","bitget")
