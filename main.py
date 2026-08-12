@@ -17,6 +17,7 @@ from PySide6.QtWidgets import (
 )
 
 SERVICE = "ArbitrageClient"
+MAX_ASSET_PRICE_RATIO = 3.0
 EXCHANGES = ("bybit", "okx", "bitget")
 
 
@@ -149,7 +150,8 @@ def pair_candidates(markets, fees, minnet, enabled_exchanges):
                 # more than a plausible cross-exchange arbitrage ratio.
                 # XTER example: 405 / 0.00789 ~= 51,000x -> rejected.
                 ratio = sp / bp
-                if ratio > MAX_ASSET_PRICE_RATIO or ratio < (1 / MAX_ASSET_PRICE_RATIO):
+                max_ratio = 3.0
+                if ratio > max_ratio or ratio < (1 / max_ratio):
                     continue
 
                 buyfee = fees[buy_ex]
@@ -192,7 +194,8 @@ def depth(buybook, sellbook, bf, sf, capital, minnet):
         return None
 
     live_ratio = bids[0][0] / asks[0][0]
-    if live_ratio > MAX_ASSET_PRICE_RATIO or live_ratio < (1 / MAX_ASSET_PRICE_RATIO):
+    max_ratio = 3.0
+if live_ratio > max_ratio or live_ratio < (1 / max_ratio):
         return None
 
     ai = bi = 0
