@@ -1,4 +1,4 @@
-# Arbitrage Client 0.6.2
+# Arbitrage Client 0.6.2.1
 # Read-only spot arbitrage scanner: Bybit <-> OKX <-> Bitget.
 # Uses CCXT and real order-book depth. No orders are placed.
 
@@ -13,7 +13,7 @@ from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QPushButton, QGroupBox, QDialog, QFormLayout, QLineEdit,
     QMessageBox, QTableWidget, QTableWidgetItem, QDoubleSpinBox,
-    QSpinBox, QHeaderView
+    QSpinBox, QHeaderView, QCheckBox
 )
 
 SERVICE = "ArbitrageClient"
