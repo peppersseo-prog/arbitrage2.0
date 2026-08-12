@@ -1,13 +1,10 @@
-# Arbitrage Client 0.6.2.1
-# Read-only spot arbitrage scanner: Bybit <-> OKX <-> Bitget.
-# Uses CCXT and real order-book depth. No orders are placed.
-
-import sys, json
+# Arbitrage Client 0.7
+import sys
+import json
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import ccxt
 import keyring
-
 from PySide6.QtCore import QTimer, QThread, QObject, Signal
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -17,15 +14,13 @@ from PySide6.QtWidgets import (
 )
 
 SERVICE = "ArbitrageClient"
-MAX_ASSET_PRICE_RATIO = 3.0
 EXCHANGES = ("bybit", "okx", "bitget")
 
 
 def save_credentials(ex, key, secret, password=""):
-    keyring.set_password(
-        SERVICE, ex,
-        json.dumps({"api_key": key, "api_secret": secret, "password": password})
-    )
+    keyring.set_password(SERVICE, ex, json.dumps({
+        "api_key": key, "api_secret": secret, "password": password
+    }))
 
 
 def load_credentials(ex):
@@ -57,171 +52,194 @@ def make(ex):
         "secret": c["api_secret"],
         "enableRateLimit": True,
         "timeout": 20000,
+        "options": {"defaultType": "spot"},
     }
 
+    if ex in ("okx", "bitget"):
+        cfg["password"] = c.get("password", "")
+
     if ex == "okx":
-        cfg["password"] = c.get("password", "")
-        cfg["options"] = {"defaultType": "spot"}
         return ccxt.okx(cfg)
-
     if ex == "bitget":
-        # Bitget calls the API passphrase "password" in CCXT.
-        cfg["password"] = c.get("password", "")
-        cfg["options"] = {"defaultType": "spot"}
         return ccxt.bitget(cfg)
-
-    cfg["options"] = {"defaultType": "spot"}
     return ccxt.bybit(cfg)
 
 
+def market_identity(market):
+    """Use contract/network first, then baseId. Never ticker alone."""
+    if not isinstance(market, dict):
+        return None
+
+    info = market.get("info") or {}
+
+    address = (
+        market.get("contractAddress") or
+        market.get("contract") or
+        market.get("tokenAddress") or
+        info.get("contractAddress") or
+        info.get("contract_address") or
+        info.get("tokenAddress") or
+        info.get("token_address") or
+        info.get("address") or ""
+    )
+
+    network = (
+        market.get("network") or
+        market.get("chain") or
+        info.get("network") or
+        info.get("chain") or
+        info.get("networkName") or
+        info.get("chainName") or ""
+    )
+
+    address = str(address).strip().lower()
+    network = str(network).strip().lower()
+
+    if address:
+        return ("contract", network, address)
+
+    base_id = market.get("baseId")
+    if base_id:
+        return ("baseid", str(base_id).strip().lower())
+
+    return None
+
+
 def tickers(ex):
-    x = make(ex)
-    x.load_markets()
+    exchange = make(ex)
+    exchange.load_markets()
+
+    symbols = []
+    for symbol, market in exchange.markets.items():
+        if not isinstance(symbol, str):
+            continue
+        if market.get("quote") != "USDT":
+            continue
+        if market.get("active") is False:
+            continue
+        if not (market.get("spot") is True or market.get("type") == "spot"):
+            continue
+        symbols.append(symbol)
 
     if ex == "bybit":
-        d = x.fetch_tickers(params={"category": "spot"})
+        data = exchange.fetch_tickers(symbols, params={"category": "spot"})
     else:
-        d = x.fetch_tickers()
+        data = exchange.fetch_tickers(symbols)
 
     out = {}
-    items = d.items() if hasattr(d, "items") else []
-
-    for s, t in items:
-        if not isinstance(s, str) or not s.endswith("/USDT") or s not in x.markets:
-            continue
-
-        m = x.markets[s]
-        if m.get("active") is False or m.get("spot") is not True:
-            continue
-
-        bid = n(t.get("bid")) if isinstance(t, dict) else 0
-        ask = n(t.get("ask")) if isinstance(t, dict) else 0
-
+    for symbol, ticker in data.items():
+        bid = n(ticker.get("bid"))
+        ask = n(ticker.get("ask"))
         if bid > 0 and ask > 0:
-            out[s] = {"bid": bid, "ask": ask}
+            out[symbol] = {
+                "bid": bid,
+                "ask": ask,
+                "market": exchange.markets[symbol],
+            }
 
     return out
 
 
 def book(ex, symbol):
-    x = make(ex)
-    x.load_markets()
+    exchange = make(ex)
+    exchange.load_markets()
 
     if ex == "bybit":
-        return x.fetch_order_book(symbol, limit=50, params={"category": "spot"})
+        return exchange.fetch_order_book(
+            symbol, limit=50, params={"category": "spot"}
+        )
+    return exchange.fetch_order_book(symbol, limit=50)
 
-    return x.fetch_order_book(symbol, limit=50)
 
+def pair_candidates(markets, fees, minnet, enabled):
+    """Find pairs by verified asset identity, not ticker equality."""
+    identities = {}
 
-def pair_candidates(markets, fees, minnet, enabled_exchanges):
-    """
-    Return directed arbitrage candidates.
+    for ex in enabled:
+        identities[ex] = {}
+        for symbol, data in markets.get(ex, {}).items():
+            identity = market_identity(data.get("market"))
+            if identity is not None:
+                identities[ex].setdefault(identity, []).append(symbol)
 
-    IMPORTANT:
-    A unified CCXT symbol such as XTER/USDT is only a ticker, not a
-    cryptographic proof that the underlying assets are identical.
-    Different exchanges can reuse the same ticker for completely different
-    assets. We therefore apply:
-      1) same unified symbol;
-      2) same quote currency;
-      3) conservative price-ratio sanity check.
-    """
+    result = []
 
-    z = []
-
-    for buy_ex in enabled_exchanges:
-        for sell_ex in enabled_exchanges:
+    for buy_ex in enabled:
+        for sell_ex in enabled:
             if buy_ex == sell_ex:
                 continue
 
-            common = set(markets.get(buy_ex, {})) & set(markets.get(sell_ex, {}))
+            common = (
+                set(identities.get(buy_ex, {}))
+                & set(identities.get(sell_ex, {}))
+            )
 
-            for s in common:
-                a = markets[buy_ex][s]
-                b = markets[sell_ex][s]
+            for identity in common:
+                for buy_symbol in identities[buy_ex][identity]:
+                    for sell_symbol in identities[sell_ex][identity]:
+                        buy = markets[buy_ex][buy_symbol]
+                        sell = markets[sell_ex][sell_symbol]
 
-                bp = a["ask"]
-                sp = b["bid"]
+                        bp = buy["ask"]
+                        sp = sell["bid"]
+                        if bp <= 0 or sp <= 0:
+                            continue
 
-                if bp <= 0 or sp <= 0:
-                    continue
+                        bf = fees[buy_ex]
+                        sf = fees[sell_ex]
+                        net = (
+                            sp * (1 - sf) /
+                            (bp * (1 + bf)) - 1
+                        ) * 100
 
-                # Do not compare the same ticker when its prices differ by
-                # more than a plausible cross-exchange arbitrage ratio.
-                # XTER example: 405 / 0.00789 ~= 51,000x -> rejected.
-                ratio = sp / bp
-                max_ratio = 3.0
-                if ratio > max_ratio or ratio < (1 / max_ratio):
-                    continue
+                        if net >= minnet:
+                            result.append({
+                                "net": net,
+                                "buy_symbol": buy_symbol,
+                                "sell_symbol": sell_symbol,
+                                "buy": buy_ex,
+                                "sell": sell_ex,
+                                "identity": identity,
+                            })
 
-                buyfee = fees[buy_ex]
-                sellfee = fees[sell_ex]
-
-                gross = (ratio - 1) * 100
-                net = (
-                    sp * (1 - sellfee) /
-                    (bp * (1 + buyfee)) - 1
-                ) * 100
-
-                if net >= minnet:
-                    z.append((net, s, buy_ex, sell_ex))
-
-    z.sort(reverse=True)
-    return z
+    result.sort(key=lambda x: x["net"], reverse=True)
+    return result
 
 
 def depth(buybook, sellbook, bf, sf, capital, minnet):
     def levels(raw):
-        out = []
-        for level in (raw or []):
-            # Some exchanges may return extra fields per level.
+        result = []
+        for level in raw or []:
             if not isinstance(level, (list, tuple)) or len(level) < 2:
                 continue
-            p = n(level[0])
-            q = n(level[1])
+            p, q = n(level[0]), n(level[1])
             if p > 0 and q > 0:
-                out.append((p, q))
-        return out
+                result.append((p, q))
+        return result
 
     asks = sorted(levels(buybook.get("asks", [])))
     bids = sorted(levels(sellbook.get("bids", [])), reverse=True)
 
-  if not asks or not bids:
-    return None
+    if not asks or not bids:
+        return None
 
-if asks[0][0] <= 0 or bids[0][0] <= 0:
-    return None
-
-live_ratio = bids[0][0] / asks[0][0]
-max_ratio = 3.0
-
-if live_ratio > max_ratio or live_ratio < (1 / max_ratio):
-    return None
-
-ai = bi = 0
-    ar = asks[0][1]
-    br = bids[0][1]
-
+    ai = bi = 0
+    ar, br = asks[0][1], bids[0][1]
     qty = cost = sell = 0.0
 
     while ai < len(asks) and bi < len(bids):
         ap, bp = asks[ai][0], bids[bi][0]
-
-        # If the best executable sell is not above the buy price,
-        # there is no profitable overlap at this depth level.
         if bp <= ap:
             break
 
         cap = max(0.0, (capital - cost) / (ap * (1 + bf)))
         q = min(ar, br, cap)
-
         if q <= 0:
             break
 
         qty += q
         cost += q * ap
         sell += q * bp
-
         ar -= q
         br -= q
 
@@ -235,12 +253,11 @@ ai = bi = 0
             if bi < len(bids):
                 br = bids[bi][1]
 
-    if qty <= 0:
+    if qty <= 0 or cost <= 0:
         return None
 
     profit = sell * (1 - sf) - cost * (1 + bf)
     net = profit / cost * 100
-
     if net < minnet:
         return None
 
@@ -263,118 +280,123 @@ class Worker(QObject):
     done = Signal(object, object)
     err = Signal(str)
 
-    def __init__(self, fees, capital, minnet, limit, enabled_exchanges):
+    def __init__(self, fees, capital, minnet, limit, enabled):
         super().__init__()
         self.fees = fees
         self.capital = capital
         self.minnet = minnet
         self.limit = limit
-        self.enabled_exchanges = list(enabled_exchanges)
+        self.enabled = list(enabled)
         self.stop_requested = False
 
     def stop(self):
         self.stop_requested = True
 
+    def _status(self, markets, checked):
+        sets = [
+            set(markets.get(ex, {}))
+            for ex in self.enabled if markets.get(ex)
+        ]
+        common = len(set.intersection(*sets)) if len(sets) >= 2 else 0
+        return {
+            "bybit": len(markets.get("bybit", {})),
+            "okx": len(markets.get("okx", {})),
+            "bitget": len(markets.get("bitget", {})),
+            "common": common,
+            "checked": checked,
+        }
+
     def run(self):
+        markets = {}
         try:
-            if self.stop_requested:
-                self.done.emit([], {"bybit":0,"okx":0,"bitget":0,"common":0,"checked":0})
+            if len(self.enabled) < 2:
+                self.done.emit([], self._status(markets, 0))
                 return
 
-            if len(self.enabled_exchanges) < 2:
-                self.done.emit([], {"bybit":0,"okx":0,"bitget":0,"common":0,"checked":0})
-                return
+            with ThreadPoolExecutor(max_workers=len(self.enabled)) as pool:
+                futures = {pool.submit(tickers, ex): ex for ex in self.enabled}
 
-            markets = {}
-
-            with ThreadPoolExecutor(max_workers=len(self.enabled_exchanges)) as p:
-                fs = {p.submit(tickers, ex): ex for ex in self.enabled_exchanges}
-                for f in as_completed(fs):
+                for future in as_completed(futures):
                     if self.stop_requested:
-                        for pending in fs:
-                            if not pending.done():
-                                pending.cancel()
-                        self.done.emit([], {"bybit":0,"okx":0,"bitget":0,"common":0,"checked":0})
+                        for f in futures:
+                            f.cancel()
+                        self.done.emit([], self._status(markets, 0))
                         return
-                    ex = fs[f]
-                    markets[ex] = f.result()
+                    markets[futures[future]] = future.result()
 
             for ex in EXCHANGES:
                 markets.setdefault(ex, {})
 
-            if self.stop_requested:
-                self.done.emit([], {"bybit":len(markets["bybit"]),"okx":len(markets["okx"]),"bitget":len(markets["bitget"]),"common":0,"checked":0})
-                return
-
-            cs = pair_candidates(markets, self.fees, self.minnet, self.enabled_exchanges)
-            cs = cs[:self.limit]
+            candidates = pair_candidates(
+                markets, self.fees, self.minnet, self.enabled
+            )[:self.limit]
 
             books = {}
 
-            with ThreadPoolExecutor(10) as p:
-                fs = {}
-                for _, symbol, buy, sell in cs:
-                    key = (symbol, buy, sell)
-                    fs[p.submit(book, buy, symbol)] = (key, "buy")
-                    fs[p.submit(book, sell, symbol)] = (key, "sell")
+            with ThreadPoolExecutor(max_workers=10) as pool:
+                futures = {}
+                for c in candidates:
+                    key = (
+                        c["buy_symbol"], c["sell_symbol"],
+                        c["buy"], c["sell"]
+                    )
+                    futures[pool.submit(
+                        book, c["buy"], c["buy_symbol"]
+                    )] = (key, "buy")
+                    futures[pool.submit(
+                        book, c["sell"], c["sell_symbol"]
+                    )] = (key, "sell")
 
-                for f in as_completed(fs):
+                for future in as_completed(futures):
                     if self.stop_requested:
-                        for pending in fs:
-                            if not pending.done():
-                                pending.cancel()
-                        self.done.emit([], {"bybit":len(markets["bybit"]),"okx":len(markets["okx"]),"bitget":len(markets["bitget"]),"common":0,"checked":len(cs)})
+                        for f in futures:
+                            f.cancel()
+                        self.done.emit(
+                            [], self._status(markets, len(candidates))
+                        )
                         return
-                    key, side = fs[f]
+                    key, side = futures[future]
                     try:
-                        books.setdefault(key, {})[side] = f.result()
+                        books.setdefault(key, {})[side] = future.result()
                     except Exception:
                         pass
 
-            if self.stop_requested:
-                self.done.emit([], {"bybit":len(markets["bybit"]),"okx":len(markets["okx"]),"bitget":len(markets["bitget"]),"common":0,"checked":len(cs)})
-                return
-
             rows = []
-
-            for _, symbol, buy, sell in cs:
+            for c in candidates:
                 if self.stop_requested:
-                    self.done.emit([], {"bybit":len(markets["bybit"]),"okx":len(markets["okx"]),"bitget":len(markets["bitget"]),"common":0,"checked":len(cs)})
+                    self.done.emit(
+                        [], self._status(markets, len(candidates))
+                    )
                     return
 
-                key = (symbol, buy, sell)
-                bb = books.get(key, {})
-                if "buy" not in bb or "sell" not in bb:
+                key = (
+                    c["buy_symbol"], c["sell_symbol"],
+                    c["buy"], c["sell"]
+                )
+                pair = books.get(key, {})
+                if "buy" not in pair or "sell" not in pair:
                     continue
 
                 r = depth(
-                    bb["buy"], bb["sell"],
-                    self.fees[buy], self.fees[sell],
+                    pair["buy"], pair["sell"],
+                    self.fees[c["buy"]], self.fees[c["sell"]],
                     self.capital, self.minnet
                 )
-
                 if r:
-                    r.update(symbol=symbol, buy=buy, sell=sell)
+                    r.update(
+                        symbol=c["buy_symbol"],
+                        sell_symbol=c["sell_symbol"],
+                        buy=c["buy"],
+                        sell=c["sell"]
+                    )
                     rows.append(r)
 
             rows.sort(key=lambda x: x["profit"], reverse=True)
-
-            status = {
-                "bybit": len(markets["bybit"]),
-                "okx": len(markets["okx"]),
-                "bitget": len(markets["bitget"]),
-                "common": len(set(markets["bybit"]) & set(markets["okx"]) & set(markets["bitget"])),
-                "checked": len(cs),
-            }
-
-            self.done.emit(rows, status)
+            self.done.emit(rows, self._status(markets, len(candidates)))
 
         except Exception as e:
             if not self.stop_requested:
                 self.err.emit(f"{type(e).__name__}: {e}")
-            else:
-                self.done.emit([], {"bybit":0,"okx":0,"bitget":0,"common":0,"checked":0})
-
 
 
 class Api(QDialog):
@@ -383,80 +405,62 @@ class Api(QDialog):
         self.ex = ex
         self.setWindowTitle("Connect " + ex.upper())
 
-        v = QVBoxLayout(self)
-        f = QFormLayout()
+        layout = QVBoxLayout(self)
+        form = QFormLayout()
 
         self.k = QLineEdit()
         self.s = QLineEdit()
         self.s.setEchoMode(QLineEdit.Password)
-
         self.p = QLineEdit()
         self.p.setEchoMode(QLineEdit.Password)
 
-        f.addRow("API Key:", self.k)
-        f.addRow("API Secret:", self.s)
-
+        form.addRow("API Key:", self.k)
+        form.addRow("API Secret:", self.s)
         if ex in ("okx", "bitget"):
-            f.addRow("Passphrase:", self.p)
+            form.addRow("Passphrase:", self.p)
 
-        v.addLayout(f)
-
-        b = QPushButton("Save")
-        b.clicked.connect(self.save)
-        v.addWidget(b)
+        layout.addLayout(form)
+        button = QPushButton("Save")
+        button.clicked.connect(self.save)
+        layout.addWidget(button)
 
     def save(self):
         if not self.k.text() or not self.s.text():
-            QMessageBox.warning(
-                self,
-                "Error",
-                "API Key и Secret обязательны."
-            )
+            QMessageBox.warning(self, "Error", "API Key и Secret обязательны.")
             return
-
         if self.ex in ("okx", "bitget") and not self.p.text():
-            QMessageBox.warning(
-                self,
-                "Error",
-                "Passphrase обязательна для " + self.ex.upper() + "."
-            )
+            QMessageBox.warning(self, "Error", "Passphrase обязательна.")
             return
 
         save_credentials(
-            self.ex,
-            self.k.text(),
-            self.s.text(),
-            self.p.text()
+            self.ex, self.k.text(), self.s.text(), self.p.text()
         )
-
         self.accept()
 
 
-class Ex(QWidget):
+class ExchangeWidget(QWidget):
     def __init__(self, name, app):
         super().__init__()
         self.name = name
         self.app = app
 
-        l = QHBoxLayout(self)
-
+        layout = QHBoxLayout(self)
         self.enabled = QCheckBox("Enabled")
         self.enabled.setChecked(True)
-        l.addWidget(self.enabled)
+        layout.addWidget(self.enabled)
+        layout.addWidget(QLabel(name.upper()))
 
-        l.addWidget(QLabel(name.upper()))
+        self.state = QLabel()
+        layout.addWidget(self.state)
+        layout.addStretch()
 
-        self.st = QLabel()
-        l.addWidget(self.st)
-        l.addStretch()
+        connect = QPushButton("Connect / Test")
+        connect.clicked.connect(self.connect)
+        layout.addWidget(connect)
 
-        b = QPushButton("Connect / Test")
-        b.clicked.connect(self.connect)
-        l.addWidget(b)
-
-        b = QPushButton("Delete")
-        b.clicked.connect(self.delete)
-        l.addWidget(b)
+        delete = QPushButton("Delete")
+        delete.clicked.connect(self.delete)
+        layout.addWidget(delete)
 
         self.refresh()
 
@@ -464,18 +468,19 @@ class Ex(QWidget):
         return self.enabled.isChecked()
 
     def refresh(self):
-        state = "● Connected" if load_credentials(self.name) else "○ Not connected"
-        self.st.setText(state)
+        self.state.setText(
+            "● Connected" if load_credentials(self.name)
+            else "○ Not connected"
+        )
 
     def connect(self):
         if not load_credentials(self.name):
             if Api(self.name, self.app).exec():
                 self.refresh()
             return
-
         try:
             make(self.name).fetch_balance()
-            self.st.setText("● Connected")
+            self.state.setText("● Connected")
             self.app.balances()
         except Exception as e:
             QMessageBox.critical(self.app, "Connection error", str(e))
@@ -489,40 +494,36 @@ class Ex(QWidget):
 class App(QMainWindow):
     def __init__(self):
         super().__init__()
-
-        self.setWindowTitle("Arbitrage Client 0.6.2")
+        self.setWindowTitle("Arbitrage Client 0.7")
         self.resize(1450, 800)
 
-        self.th = None
-        self.w = None
+        self.thread = None
+        self.worker = None
         self.running = False
 
         root = QWidget()
         self.setCentralWidget(root)
-        v = QVBoxLayout(root)
+        layout = QVBoxLayout(root)
 
-        h = QLabel("ARBITRAGE CLIENT 0.6.2")
-        h.setStyleSheet("font-size:26px;font-weight:bold;")
-        v.addWidget(h)
-
-        v.addWidget(QLabel(
-            "Read-only spot arbitrage scanner: "
-            "BYBIT ↔ OKX ↔ BITGET with real order-book depth."
+        title = QLabel("ARBITRAGE CLIENT 0.7")
+        title.setStyleSheet("font-size:26px;font-weight:bold;")
+        layout.addWidget(title)
+        layout.addWidget(QLabel(
+            "Verified asset-identity spot arbitrage scanner: "
+            "BYBIT ↔ OKX ↔ BITGET."
         ))
 
-        g = QGroupBox("Exchanges")
-        gl = QVBoxLayout(g)
-
-        self.ex_widgets = {}
+        group = QGroupBox("Exchanges")
+        group_layout = QVBoxLayout(group)
+        self.exchange_widgets = {}
         for ex in EXCHANGES:
-            w = Ex(ex, self)
-            self.ex_widgets[ex] = w
-            gl.addWidget(w)
+            w = ExchangeWidget(ex, self)
+            self.exchange_widgets[ex] = w
+            group_layout.addWidget(w)
+        layout.addWidget(group)
 
-        v.addWidget(g)
-
-        g = QGroupBox("Scanner settings")
-        sl = QHBoxLayout(g)
+        settings_group = QGroupBox("Scanner settings")
+        settings = QHBoxLayout(settings_group)
 
         self.cap = QDoubleSpinBox()
         self.cap.setRange(1, 1e7)
@@ -557,7 +558,7 @@ class App(QMainWindow):
         self.lim.setRange(5, 300)
         self.lim.setValue(50)
 
-        settings = [
+        for label, widget in [
             ("Capital USDT:", self.cap),
             ("Bybit taker %:", self.bf),
             ("OKX taker %:", self.of),
@@ -565,89 +566,71 @@ class App(QMainWindow):
             ("Min net %:", self.mn),
             ("Refresh sec:", self.sec),
             ("Order books:", self.lim),
-        ]
+        ]:
+            settings.addWidget(QLabel(label))
+            settings.addWidget(widget)
 
-        for t, x in settings:
-            sl.addWidget(QLabel(t))
-            sl.addWidget(x)
+        layout.addWidget(settings_group)
 
-        v.addWidget(g)
-
-        c = QHBoxLayout()
-
+        controls = QHBoxLayout()
         self.start = QPushButton("▶ Start scanner")
         self.start.clicked.connect(self.toggle)
-        c.addWidget(self.start)
+        controls.addWidget(self.start)
 
-        for t, f in [
-            ("Refresh now", self.scan),
-            ("Refresh balances", self.balances)
-        ]:
-            b = QPushButton(t)
-            b.clicked.connect(f)
-            c.addWidget(b)
+        refresh = QPushButton("Refresh now")
+        refresh.clicked.connect(self.scan)
+        controls.addWidget(refresh)
 
-        c.addStretch()
+        balances = QPushButton("Refresh balances")
+        balances.clicked.connect(self.balances)
+        controls.addWidget(balances)
 
+        controls.addStretch()
         self.status = QLabel("Ready")
-        c.addWidget(self.status)
-        v.addLayout(c)
+        controls.addWidget(self.status)
+        layout.addLayout(controls)
 
-        self.tab = QTableWidget(0, 13)
-
-        self.tab.setHorizontalHeaderLabels([
-            "Coin", "BUY", "SELL",
-            "Top buy", "Top sell",
-            "Avg buy", "Avg sell",
-            "Top gross %", "Real net %",
+        self.table = QTableWidget(0, 13)
+        self.table.setHorizontalHeaderLabels([
+            "Coin", "BUY", "SELL", "Top buy", "Top sell",
+            "Avg buy", "Avg sell", "Top gross %", "Real net %",
             "Qty", "Notional", "Profit", "Fees"
         ])
+        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        layout.addWidget(self.table)
 
-        self.tab.horizontalHeader().setSectionResizeMode(
-            QHeaderView.Stretch
-        )
-
-        v.addWidget(self.tab)
-
-        g = QGroupBox("USDT Spot Balance")
-        bl = QHBoxLayout(g)
-
+        balances_group = QGroupBox("USDT Spot Balance")
+        balances_layout = QHBoxLayout(balances_group)
         self.balance_labels = {}
-
         for ex in EXCHANGES:
             label = QLabel(ex.upper() + ": —")
             self.balance_labels[ex] = label
-            bl.addWidget(label)
-
-        bl.addStretch()
-        v.addWidget(g)
+            balances_layout.addWidget(label)
+        balances_layout.addStretch()
+        layout.addWidget(balances_group)
 
         self.timer = QTimer()
         self.timer.timeout.connect(self.scan)
 
     def balances(self):
         for ex in EXCHANGES:
-            label = self.balance_labels[ex]
-
             try:
-                bal = make(ex).fetch_balance()
-                free = n(bal.get("USDT", {}).get("free"))
-                label.setText(
+                balance = make(ex).fetch_balance()
+                free = n(balance.get("USDT", {}).get("free"))
+                self.balance_labels[ex].setText(
                     f"{ex.upper()}: {free:,.2f} USDT"
                 )
             except Exception:
-                label.setText(f"{ex.upper()}: error")
+                self.balance_labels[ex].setText(f"{ex.upper()}: error")
 
     def toggle(self):
         if self.running:
             self.running = False
             self.timer.stop()
+            if self.worker:
+                self.worker.stop()
             self.start.setEnabled(True)
             self.start.setText("▶ Start scanner")
-
-            if self.w is not None:
-                self.w.stop()
-
             self.status.setText("Stopping…")
             return
 
@@ -655,17 +638,16 @@ class App(QMainWindow):
         self.start.setEnabled(True)
         self.start.setText("■ Stop scanner")
         self.scan()
-
         if self.running:
             self.timer.start(self.sec.value() * 1000)
 
     def scan(self):
-        if self.th and self.th.isRunning():
+        if self.thread and self.thread.isRunning():
             return
 
         enabled = [
             ex for ex in EXCHANGES
-            if self.ex_widgets[ex].is_enabled()
+            if self.exchange_widgets[ex].is_enabled()
         ]
 
         if len(enabled) < 2:
@@ -675,30 +657,15 @@ class App(QMainWindow):
             self.status.setText("Enable at least 2 exchanges")
             return
 
-        not_connected = [
-            ex.upper() for ex in enabled
-            if not load_credentials(ex)
+        missing = [
+            ex.upper() for ex in enabled if not load_credentials(ex)
         ]
-
-        if not_connected:
+        if missing:
             self.running = False
             self.timer.stop()
             self.start.setText("▶ Start scanner")
-            self.status.setText(
-                "Connect: " + ", ".join(not_connected)
-            )
+            self.status.setText("Connect: " + ", ".join(missing))
             return
-
-        self.status.setText(
-            "Loading " + " + ".join(x.upper() for x in enabled) +
-            " market data…"
-        )
-
-        # CRITICAL: keep this button ENABLED while the worker is running.
-        # Previously this line was setEnabled(False), which made Stop
-        # physically impossible to press.
-        self.start.setEnabled(True)
-        self.start.setText("■ Stop scanner")
 
         fees = {
             "bybit": self.bf.value() / 100,
@@ -706,84 +673,75 @@ class App(QMainWindow):
             "bitget": self.gf.value() / 100,
         }
 
-        self.th = QThread()
-
-        self.w = Worker(
-            fees,
-            self.cap.value(),
-            self.mn.value(),
-            self.lim.value(),
-            enabled
+        self.status.setText(
+            "Loading " + " + ".join(x.upper() for x in enabled)
+            + " market data…"
         )
 
-        self.w.moveToThread(self.th)
+        self.thread = QThread()
+        self.worker = Worker(
+            fees, self.cap.value(), self.mn.value(),
+            self.lim.value(), enabled
+        )
+        self.worker.moveToThread(self.thread)
 
-        self.th.started.connect(self.w.run)
-        self.w.done.connect(self.result)
-        self.w.err.connect(self.error)
-
-        self.w.done.connect(self.th.quit)
-        self.w.err.connect(self.th.quit)
-        self.th.finished.connect(self.cleanup)
-
-        self.th.start()
+        self.thread.started.connect(self.worker.run)
+        self.worker.done.connect(self.result)
+        self.worker.err.connect(self.error)
+        self.worker.done.connect(self.thread.quit)
+        self.worker.err.connect(self.thread.quit)
+        self.thread.finished.connect(self.cleanup)
+        self.thread.start()
 
     def cleanup(self):
-        self.w = None
-        self.th = None
+        self.worker = None
+        self.thread = None
 
-    def result(self, rows, st):
+    def result(self, rows, status):
         if not self.running:
             self.status.setText("Stopped")
             return
-        self.tab.setRowCount(len(rows))
 
+        self.table.setRowCount(len(rows))
         for i, r in enumerate(rows):
-            vals = [
-                r["symbol"],
-                r["buy"].upper(),
-                r["sell"].upper(),
-                f'{r["top_buy"]:,.8g}',
-                f'{r["top_sell"]:,.8g}',
-                f'{r["avg_buy"]:,.8g}',
-                f'{r["avg_sell"]:,.8g}',
-                f'{r["top_gross"]:.4f}%',
-                f'{r["net"]:.4f}%',
-                f'{r["qty"]:,.8g}',
-                f'${r["cost"]:,.2f}',
-                f'${r["profit"]:,.4f}',
-                f'${r["fees"]:,.4f}',
+            values = [
+                r["symbol"], r["buy"].upper(), r["sell"].upper(),
+                f'{r["top_buy"]:,.8g}', f'{r["top_sell"]:,.8g}',
+                f'{r["avg_buy"]:,.8g}', f'{r["avg_sell"]:,.8g}',
+                f'{r["top_gross"]:.4f}%', f'{r["net"]:.4f}%',
+                f'{r["qty"]:,.8g}', f'${r["cost"]:,.2f}',
+                f'${r["profit"]:,.4f}', f'${r["fees"]:,.4f}',
             ]
-
-            for j, x in enumerate(vals):
-                self.tab.setItem(i, j, QTableWidgetItem(x))
+            for j, value in enumerate(values):
+                self.table.setItem(i, j, QTableWidgetItem(value))
 
         self.status.setText(
-            f'OK: Bybit {st["bybit"]} | '
-            f'OKX {st["okx"]} | '
-            f'Bitget {st["bitget"]} | '
-            f'common all 3 {st["common"]} | '
-            f'depth checked {st["checked"]} | '
+            f'OK: Bybit {status["bybit"]} | '
+            f'OKX {status["okx"]} | '
+            f'Bitget {status["bitget"]} | '
+            f'common enabled {status["common"]} | '
+            f'depth checked {status["checked"]} | '
             f'opportunities {len(rows)}'
         )
 
-    def error(self, msg):
+    def error(self, message):
         if not self.running:
             self.status.setText("Stopped")
             return
         self.status.setText("Scanner error")
         QMessageBox.critical(
-            self,
-            "Scanner error",
-            "Не удалось получить данные.\n\n" + msg
+            self, "Scanner error",
+            "Не удалось получить данные.\n\n" + message
         )
 
-    def closeEvent(self, e):
+    def closeEvent(self, event):
         self.timer.stop()
-        e.accept()
+        if self.worker:
+            self.worker.stop()
+        event.accept()
 
 
 app = QApplication(sys.argv)
-win = App()
-win.show()
+window = App()
+window.show()
 sys.exit(app.exec())
