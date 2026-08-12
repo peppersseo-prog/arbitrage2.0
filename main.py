@@ -186,19 +186,19 @@ def depth(buybook, sellbook, bf, sf, capital, minnet):
     asks = sorted(levels(buybook.get("asks", [])))
     bids = sorted(levels(sellbook.get("bids", [])), reverse=True)
 
-    if not asks or not bids:
-        return None
+  if not asks or not bids:
+    return None
 
-    # Same safety rule at the actual order-book level.
-    if asks[0][0] <= 0 or bids[0][0] <= 0:
-        return None
+if asks[0][0] <= 0 or bids[0][0] <= 0:
+    return None
 
-    live_ratio = bids[0][0] / asks[0][0]
-    max_ratio = 3.0
+live_ratio = bids[0][0] / asks[0][0]
+max_ratio = 3.0
+
 if live_ratio > max_ratio or live_ratio < (1 / max_ratio):
-        return None
+    return None
 
-    ai = bi = 0
+ai = bi = 0
     ar = asks[0][1]
     br = bids[0][1]
 
