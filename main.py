@@ -1,4 +1,4 @@
-# Arbitrage Client 0.6.1
+# Arbitrage Client 0.6.2
 # Read-only spot arbitrage scanner: Bybit <-> OKX <-> Bitget.
 # Uses CCXT and real order-book depth. No orders are placed.
 
@@ -114,9 +114,18 @@ def book(ex, symbol):
 
 def pair_candidates(markets, fees, minnet, enabled_exchanges):
     """
-    Return all directed arbitrage pairs:
-    buy on one exchange, sell on another.
+    Return directed arbitrage candidates.
+
+    IMPORTANT:
+    A unified CCXT symbol such as XTER/USDT is only a ticker, not a
+    cryptographic proof that the underlying assets are identical.
+    Different exchanges can reuse the same ticker for completely different
+    assets. We therefore apply:
+      1) same unified symbol;
+      2) same quote currency;
+      3) conservative price-ratio sanity check.
     """
+
     z = []
 
     for buy_ex in enabled_exchanges:
@@ -124,7 +133,7 @@ def pair_candidates(markets, fees, minnet, enabled_exchanges):
             if buy_ex == sell_ex:
                 continue
 
-            common = set(markets[buy_ex]) & set(markets[sell_ex])
+            common = set(markets.get(buy_ex, {})) & set(markets.get(sell_ex, {}))
 
             for s in common:
                 a = markets[buy_ex][s]
@@ -136,10 +145,17 @@ def pair_candidates(markets, fees, minnet, enabled_exchanges):
                 if bp <= 0 or sp <= 0:
                     continue
 
+                # Do not compare the same ticker when its prices differ by
+                # more than a plausible cross-exchange arbitrage ratio.
+                # XTER example: 405 / 0.00789 ~= 51,000x -> rejected.
+                ratio = sp / bp
+                if ratio > MAX_ASSET_PRICE_RATIO or ratio < (1 / MAX_ASSET_PRICE_RATIO):
+                    continue
+
                 buyfee = fees[buy_ex]
                 sellfee = fees[sell_ex]
 
-                gross = (sp / bp - 1) * 100
+                gross = (ratio - 1) * 100
                 net = (
                     sp * (1 - sellfee) /
                     (bp * (1 + buyfee)) - 1
@@ -169,6 +185,14 @@ def depth(buybook, sellbook, bf, sf, capital, minnet):
     bids = sorted(levels(sellbook.get("bids", [])), reverse=True)
 
     if not asks or not bids:
+        return None
+
+    # Same safety rule at the actual order-book level.
+    if asks[0][0] <= 0 or bids[0][0] <= 0:
+        return None
+
+    live_ratio = bids[0][0] / asks[0][0]
+    if live_ratio > MAX_ASSET_PRICE_RATIO or live_ratio < (1 / MAX_ASSET_PRICE_RATIO):
         return None
 
     ai = bi = 0
@@ -463,7 +487,7 @@ class App(QMainWindow):
     def __init__(self):
         super().__init__()
 
-        self.setWindowTitle("Arbitrage Client 0.6.1")
+        self.setWindowTitle("Arbitrage Client 0.6.2")
         self.resize(1450, 800)
 
         self.th = None
@@ -474,7 +498,7 @@ class App(QMainWindow):
         self.setCentralWidget(root)
         v = QVBoxLayout(root)
 
-        h = QLabel("ARBITRAGE CLIENT 0.6.1")
+        h = QLabel("ARBITRAGE CLIENT 0.6.2")
         h.setStyleSheet("font-size:26px;font-weight:bold;")
         v.addWidget(h)
 
