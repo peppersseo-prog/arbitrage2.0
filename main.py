@@ -1,4 +1,4 @@
-# Arbitrage Client 0.6
+# Arbitrage Client 0.6.1
 # Read-only spot arbitrage scanner: Bybit <-> OKX <-> Bitget.
 # Uses CCXT and real order-book depth. No orders are placed.
 
@@ -77,45 +77,20 @@ def tickers(ex):
     x = make(ex)
     x.load_markets()
 
-    # Bitget's spot API returns spot symbols as BTCUSDT/ETHUSDT etc.
-    # CCXT maps them to unified symbols such as BTC/USDT. Some CCXT
-    # versions do not populate market["spot"] consistently for Bitget,
-    # so do not rely on spot == True alone.
-    symbols = []
-    for s, m in x.markets.items():
-        if not isinstance(s, str):
-            continue
-        if m.get("quote") != "USDT":
-            continue
-        if m.get("active") is False:
-            continue
-        if m.get("spot") is True or m.get("type") == "spot":
-            symbols.append(s)
-
     if ex == "bybit":
-        d = x.fetch_tickers(symbols, params={"category": "spot"})
-    elif ex == "bitget":
-        # Explicitly request the spot markets. This avoids Bitget returning
-        # an empty/filtered result when the exchange has multiple market
-        # types available.
-        d = x.fetch_tickers(symbols)
+        d = x.fetch_tickers(params={"category": "spot"})
     else:
-        d = x.fetch_tickers(symbols)
+        d = x.fetch_tickers()
 
     out = {}
+    items = d.items() if hasattr(d, "items") else []
 
-    for s, t in (d.items() if hasattr(d, "items") else []):
-        if s not in x.markets:
+    for s, t in items:
+        if not isinstance(s, str) or not s.endswith("/USDT") or s not in x.markets:
             continue
 
         m = x.markets[s]
-
-        # Final safety check: only real USDT spot markets.
-        if m.get("quote") != "USDT":
-            continue
-        if m.get("active") is False:
-            continue
-        if not (m.get("spot") is True or m.get("type") == "spot"):
+        if m.get("active") is False or m.get("spot") is not True:
             continue
 
         bid = n(t.get("bid")) if isinstance(t, dict) else 0
@@ -124,20 +99,6 @@ def tickers(ex):
         if bid > 0 and ask > 0:
             out[s] = {"bid": bid, "ask": ask}
 
-    # If Bitget's CCXT adapter returned no unified tickers, use individual
-    # ticker requests as a fallback for the first spot symbols. This makes
-    # the diagnostic visible instead of silently showing "Bitget 0".
-    if ex == "bitget" and not out:
-        for s in symbols[:100]:
-            try:
-                t = x.fetch_ticker(s)
-                bid = n(t.get("bid"))
-                ask = n(t.get("ask"))
-                if bid > 0 and ask > 0:
-                    out[s] = {"bid": bid, "ask": ask}
-            except Exception:
-                continue
-
     return out
 
 
@@ -145,26 +106,21 @@ def book(ex, symbol):
     x = make(ex)
     x.load_markets()
 
-    if symbol not in x.markets:
-        raise RuntimeError(f"{ex.upper()}: market {symbol} not found")
-
     if ex == "bybit":
         return x.fetch_order_book(symbol, limit=50, params={"category": "spot"})
 
-    # Bitget uses the spot order-book endpoint through CCXT when the
-    # unified market is a spot market.
     return x.fetch_order_book(symbol, limit=50)
 
 
-def pair_candidates(markets, fees, minnet):
+def pair_candidates(markets, fees, minnet, enabled_exchanges):
     """
     Return all directed arbitrage pairs:
     buy on one exchange, sell on another.
     """
     z = []
 
-    for buy_ex in EXCHANGES:
-        for sell_ex in EXCHANGES:
+    for buy_ex in enabled_exchanges:
+        for sell_ex in enabled_exchanges:
             if buy_ex == sell_ex:
                 continue
 
@@ -280,12 +236,13 @@ class Worker(QObject):
     done = Signal(object, object)
     err = Signal(str)
 
-    def __init__(self, fees, capital, minnet, limit):
+    def __init__(self, fees, capital, minnet, limit, enabled_exchanges):
         super().__init__()
         self.fees = fees
         self.capital = capital
         self.minnet = minnet
         self.limit = limit
+        self.enabled_exchanges = list(enabled_exchanges)
         self.stop_requested = False
 
     def stop(self):
@@ -297,10 +254,14 @@ class Worker(QObject):
                 self.done.emit([], {"bybit":0,"okx":0,"bitget":0,"common":0,"checked":0})
                 return
 
+            if len(self.enabled_exchanges) < 2:
+                self.done.emit([], {"bybit":0,"okx":0,"bitget":0,"common":0,"checked":0})
+                return
+
             markets = {}
 
-            with ThreadPoolExecutor(3) as p:
-                fs = {p.submit(tickers, ex): ex for ex in EXCHANGES}
+            with ThreadPoolExecutor(max_workers=len(self.enabled_exchanges)) as p:
+                fs = {p.submit(tickers, ex): ex for ex in self.enabled_exchanges}
                 for f in as_completed(fs):
                     if self.stop_requested:
                         for pending in fs:
@@ -318,7 +279,7 @@ class Worker(QObject):
                 self.done.emit([], {"bybit":len(markets["bybit"]),"okx":len(markets["okx"]),"bitget":len(markets["bitget"]),"common":0,"checked":0})
                 return
 
-            cs = pair_candidates(markets, self.fees, self.minnet)
+            cs = pair_candidates(markets, self.fees, self.minnet, self.enabled_exchanges)
             cs = cs[:self.limit]
 
             books = {}
@@ -451,6 +412,11 @@ class Ex(QWidget):
         self.app = app
 
         l = QHBoxLayout(self)
+
+        self.enabled = QCheckBox("Enabled")
+        self.enabled.setChecked(True)
+        l.addWidget(self.enabled)
+
         l.addWidget(QLabel(name.upper()))
 
         self.st = QLabel()
@@ -467,11 +433,12 @@ class Ex(QWidget):
 
         self.refresh()
 
+    def is_enabled(self):
+        return self.enabled.isChecked()
+
     def refresh(self):
-        self.st.setText(
-            "● Connected" if load_credentials(self.name)
-            else "○ Not connected"
-        )
+        state = "● Connected" if load_credentials(self.name) else "○ Not connected"
+        self.st.setText(state)
 
     def connect(self):
         if not load_credentials(self.name):
@@ -484,11 +451,7 @@ class Ex(QWidget):
             self.st.setText("● Connected")
             self.app.balances()
         except Exception as e:
-            QMessageBox.critical(
-                self.app,
-                "Connection error",
-                str(e)
-            )
+            QMessageBox.critical(self.app, "Connection error", str(e))
 
     def delete(self):
         delete_credentials(self.name)
@@ -500,7 +463,7 @@ class App(QMainWindow):
     def __init__(self):
         super().__init__()
 
-        self.setWindowTitle("Arbitrage Client 0.6")
+        self.setWindowTitle("Arbitrage Client 0.6.1")
         self.resize(1450, 800)
 
         self.th = None
@@ -511,7 +474,7 @@ class App(QMainWindow):
         self.setCentralWidget(root)
         v = QVBoxLayout(root)
 
-        h = QLabel("ARBITRAGE CLIENT 0.6")
+        h = QLabel("ARBITRAGE CLIENT 0.6.1")
         h.setStyleSheet("font-size:26px;font-weight:bold;")
         v.addWidget(h)
 
@@ -652,6 +615,7 @@ class App(QMainWindow):
         if self.running:
             self.running = False
             self.timer.stop()
+            self.start.setEnabled(True)
             self.start.setText("▶ Start scanner")
 
             if self.w is not None:
@@ -661,19 +625,53 @@ class App(QMainWindow):
             return
 
         self.running = True
+        self.start.setEnabled(True)
         self.start.setText("■ Stop scanner")
         self.scan()
-        self.timer.start(self.sec.value() * 1000)
+
+        if self.running:
+            self.timer.start(self.sec.value() * 1000)
 
     def scan(self):
         if self.th and self.th.isRunning():
             return
 
+        enabled = [
+            ex for ex in EXCHANGES
+            if self.ex_widgets[ex].is_enabled()
+        ]
+
+        if len(enabled) < 2:
+            self.running = False
+            self.timer.stop()
+            self.start.setText("▶ Start scanner")
+            self.status.setText("Enable at least 2 exchanges")
+            return
+
+        not_connected = [
+            ex.upper() for ex in enabled
+            if not load_credentials(ex)
+        ]
+
+        if not_connected:
+            self.running = False
+            self.timer.stop()
+            self.start.setText("▶ Start scanner")
+            self.status.setText(
+                "Connect: " + ", ".join(not_connected)
+            )
+            return
+
         self.status.setText(
-            "Loading Bybit + OKX + Bitget market data…"
+            "Loading " + " + ".join(x.upper() for x in enabled) +
+            " market data…"
         )
 
-        self.start.setEnabled(False)
+        # CRITICAL: keep this button ENABLED while the worker is running.
+        # Previously this line was setEnabled(False), which made Stop
+        # physically impossible to press.
+        self.start.setEnabled(True)
+        self.start.setText("■ Stop scanner")
 
         fees = {
             "bybit": self.bf.value() / 100,
@@ -687,7 +685,8 @@ class App(QMainWindow):
             fees,
             self.cap.value(),
             self.mn.value(),
-            self.lim.value()
+            self.lim.value(),
+            enabled
         )
 
         self.w.moveToThread(self.th)
@@ -698,10 +697,6 @@ class App(QMainWindow):
 
         self.w.done.connect(self.th.quit)
         self.w.err.connect(self.th.quit)
-
-        self.th.finished.connect(
-            lambda: self.start.setEnabled(True)
-        )
         self.th.finished.connect(self.cleanup)
 
         self.th.start()
@@ -711,6 +706,9 @@ class App(QMainWindow):
         self.th = None
 
     def result(self, rows, st):
+        if not self.running:
+            self.status.setText("Stopped")
+            return
         self.tab.setRowCount(len(rows))
 
         for i, r in enumerate(rows):
@@ -743,6 +741,9 @@ class App(QMainWindow):
         )
 
     def error(self, msg):
+        if not self.running:
+            self.status.setText("Stopped")
+            return
         self.status.setText("Scanner error")
         QMessageBox.critical(
             self,
