@@ -450,7 +450,7 @@ def transfer_options(ex, base):
             active=d.get("active")
             fee=n(d.get("fee"))
             key=_network_key(name,d)
-            if not key or w is not True or fee <= 0:
+            if not key or w is not True:
                 continue
             if active is False:
                 continue
