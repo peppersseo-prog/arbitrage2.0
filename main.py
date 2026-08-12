@@ -1,16 +1,18 @@
 import sys, json
 from concurrent.futures import ThreadPoolExecutor
 import ccxt, keyring
-from PySide6.QtCore import Qt, QTimer, QThread, QObject, Signal
+from PySide6.QtCore import QTimer, QThread, QObject, Signal
 from PySide6.QtWidgets import QApplication,QMainWindow,QWidget,QVBoxLayout,QHBoxLayout,QLabel,QPushButton,QGroupBox,QDialog,QFormLayout,QLineEdit,QMessageBox,QTableWidget,QTableWidgetItem,QDoubleSpinBox,QSpinBox,QHeaderView
 
 SERVICE="ArbitrageClient"
 
 def save_credentials(ex,key,secret,password=""):
     keyring.set_password(SERVICE,ex,json.dumps({"api_key":key,"api_secret":secret,"password":password}))
+
 def load_credentials(ex):
     x=keyring.get_password(SERVICE,ex)
     return json.loads(x) if x else None
+
 def delete_credentials(ex):
     try:keyring.delete_password(SERVICE,ex)
     except Exception:pass
@@ -18,8 +20,12 @@ def delete_credentials(ex):
 def create_exchange(name):
     c=load_credentials(name)
     if not c: raise RuntimeError(f"{name.upper()}: API credentials not found")
-    cfg={"apiKey":c["api_key"],"secret":c["api_secret"],"enableRateLimit":True,"timeout":15000}
-    if name=="okx": cfg["password"]=c["password"]
+    cfg={"apiKey":c["api_key"],"secret":c["api_secret"],"enableRateLimit":True,"timeout":20000}
+    if name=="bybit":
+        cfg["options"]={"defaultType":"spot"}
+    else:
+        cfg["password"]=c["password"]
+        cfg["options"]={"defaultType":"spot"}
     return ccxt.bybit(cfg) if name=="bybit" else ccxt.okx(cfg)
 
 def f(x):
@@ -29,12 +35,15 @@ def f(x):
 def tickers(name):
     ex=create_exchange(name)
     ex.load_markets()
-    data=ex.fetch_tickers()
+    if name=="bybit":
+        data=ex.fetch_tickers(params={"category":"spot"})
+    else:
+        data=ex.fetch_tickers()
     out={}
     for s,t in data.items():
         if not s.endswith("/USDT") or s not in ex.markets: continue
         m=ex.markets[s]
-        if m.get("active") is False or m.get("spot") is False: continue
+        if m.get("active") is False or m.get("spot") is not True or m.get("quote")!="USDT": continue
         bid,ask=f(t.get("bid")),f(t.get("ask"))
         if bid>0 and ask>0:
             out[s]={"bid":bid,"ask":ask,"bv":f(t.get("bidVolume")),"av":f(t.get("askVolume"))}
@@ -59,7 +68,7 @@ class Worker(QObject):
     ok=Signal(object,object)
     err=Signal(str)
     def __init__(self,fb,fo,capital,minnet):
-        super().__init__(); self.fb=fb;self.fo=fo;self.capital=capital;self.minnet=minnet
+        super().__init__();self.fb=fb;self.fo=fo;self.capital=capital;self.minnet=minnet
     def run(self):
         try:
             with ThreadPoolExecutor(max_workers=2) as p:
@@ -77,7 +86,8 @@ class Api(QDialog):
         if ex=="okx":fml.addRow("Passphrase:",self.pw)
         v.addLayout(fml);b=QPushButton("Save");b.clicked.connect(self.save);v.addWidget(b)
     def save(self):
-        if not self.key.text() or not self.sec.text():QMessageBox.warning(self,"Error","API Key и Secret обязательны.");return
+        if not self.key.text() or not self.sec.text():
+            QMessageBox.warning(self,"Error","API Key и Secret обязательны.");return
         save_credentials(self.ex,self.key.text(),self.sec.text(),self.pw.text());self.accept()
 
 class ExRow(QWidget):
@@ -90,14 +100,14 @@ class ExRow(QWidget):
             if Api(self.name,self.p).exec():self.refresh()
             return
         try:create_exchange(self.name).fetch_balance();self.st.setText("● Connected");self.p.refresh_balances()
-        except Exception as e: self.st.setText("● Error");QMessageBox.critical(self.p,"Connection error",str(e))
+        except Exception as e:self.st.setText("● Error");QMessageBox.critical(self.p,"Connection error",str(e))
     def delete(self):delete_credentials(self.name);self.refresh();self.p.refresh_balances()
 
 class App(QMainWindow):
     def __init__(self):
-        super().__init__();self.setWindowTitle("Arbitrage Client 0.3.1");self.resize(1120,720);self.th=None;self.wk=None;self.running=False
+        super().__init__();self.setWindowTitle("Arbitrage Client 0.3.2");self.resize(1120,720);self.th=None;self.wk=None;self.running=False
         v=QVBoxLayout();w=QWidget();w.setLayout(v);self.setCentralWidget(w)
-        h=QLabel("ARBITRAGE CLIENT 0.3.1");h.setStyleSheet("font-size:26px;font-weight:bold;");v.addWidget(h);v.addWidget(QLabel("Read-only spot arbitrage scanner: BYBIT ↔ OKX."))
+        h=QLabel("ARBITRAGE CLIENT 0.3.2");h.setStyleSheet("font-size:26px;font-weight:bold;");v.addWidget(h);v.addWidget(QLabel("Read-only spot arbitrage scanner: BYBIT ↔ OKX."))
         g=QGroupBox("Exchanges");gl=QVBoxLayout(g);self.br=ExRow("bybit",self);self.orow=ExRow("okx",self);gl.addWidget(self.br);gl.addWidget(self.orow);v.addWidget(g)
         s=QGroupBox("Scanner settings");sl=QHBoxLayout(s)
         self.cap=QDoubleSpinBox();self.cap.setRange(1,1e7);self.cap.setValue(1000);self.cap.setDecimals(2)
@@ -135,7 +145,7 @@ class App(QMainWindow):
             for j,x in enumerate(vals):self.tab.setItem(i,j,QTableWidgetItem(x))
         self.status.setText(f"OK: Bybit {stats[0]} | OKX {stats[1]} | common pairs {stats[2]} | opportunities {len(rows)}")
     def failed(self,msg):
-        self.status.setText("Scanner error");QMessageBox.critical(self,"Scanner error","Не удалось получить рыночные данные.\n\n"+msg)
+        self.status.setText("Scanner error");QMessageBox.critical(self,"Scanner error","Не удалось получить рыночные данные.\\n\\n"+msg)
     def closeEvent(self,e):self.timer.stop();e.accept()
 
 app=QApplication(sys.argv);win=App();win.show();sys.exit(app.exec())
