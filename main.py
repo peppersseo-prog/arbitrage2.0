@@ -400,7 +400,122 @@ def candidates(markets,fees,minnet,enabled):
                         if net>=minnet:out.append((net,bs,ss,be,se,i))
     out.sort(reverse=True,key=lambda z:z[0]);return out
 
-def depth(bb,sb,bf,sf,capital,minnet):
+
+def _network_key(name, data):
+    """Normalize a network/chain identifier for cross-exchange matching."""
+    if not isinstance(data, dict):
+        data = {}
+    vals = [
+        data.get("id"), data.get("network"), data.get("chain"),
+        data.get("chainId"), data.get("chainType"), data.get("name"), name
+    ]
+    for v in vals:
+        if v is None:
+            continue
+        x = txt(v).replace(" ", "").replace("_", "").replace("-", "")
+        aliases = {
+            "erc20":"ethereum", "eth":"ethereum", "ethereum":"ethereum",
+            "trc20":"tron", "trx":"tron", "tron":"tron",
+            "bep20":"bsc", "bep2":"bsc", "bsc":"bsc", "bnbsmartchain":"bsc",
+            "arbitrumone":"arbitrum", "arbitrum":"arbitrum",
+            "optimism":"optimism", "op":"optimism",
+            "polygon":"polygon", "matic":"polygon",
+            "sol":"solana", "solana":"solana",
+            "avaxc":"avalanchec", "avalanchec":"avalanchec",
+            "base":"base",
+        }
+        return aliases.get(x, x)
+    return ""
+
+def transfer_options(ex, base):
+    """
+    Return networks that can safely be used for BUY exchange withdrawal.
+    We require an explicit withdrawal and fee. Deposit capability is checked
+    separately on the SELL exchange.
+    """
+    try:
+        x=make(ex)
+        # fetch_currencies is needed because load_markets() does not always
+        # populate deposit/withdrawal network metadata.
+        currencies=x.fetch_currencies()
+        c=currencies.get(base.upper()) or currencies.get(base)
+        if not isinstance(c,dict):
+            return []
+        nets=c.get("networks") or {}
+        out=[]
+        for name,d in nets.items():
+            if not isinstance(d,dict):
+                continue
+            w=d.get("withdraw")
+            active=d.get("active")
+            fee=n(d.get("fee"))
+            key=_network_key(name,d)
+            if not key or w is not True or fee <= 0:
+                continue
+            if active is False:
+                continue
+            out.append({
+                "key":key,
+                "name":str(name),
+                "fee_coin":fee,
+                "min":n(((d.get("limits") or {}).get("withdraw") or {}).get("min")),
+            })
+        return out
+    except Exception:
+        return []
+
+def deposit_options(ex, base):
+    """Return networks explicitly enabled for deposits on SELL exchange."""
+    try:
+        x=make(ex)
+        currencies=x.fetch_currencies()
+        c=currencies.get(base.upper()) or currencies.get(base)
+        if not isinstance(c,dict):
+            return []
+        nets=c.get("networks") or {}
+        out=[]
+        for name,d in nets.items():
+            if not isinstance(d,dict):
+                continue
+            dep=d.get("deposit")
+            active=d.get("active")
+            key=_network_key(name,d)
+            if not key or dep is not True:
+                continue
+            if active is False:
+                continue
+            out.append({"key":key,"name":str(name)})
+        return out
+    except Exception:
+        return []
+
+def best_transfer(buy_ex,sell_ex,base,price):
+    """
+    Find the cheapest common active network:
+      BUY exchange: withdraw enabled + explicit fee
+      SELL exchange: deposit enabled
+    If either side cannot be verified, return None.
+    """
+    w=transfer_options(buy_ex,base)
+    d=deposit_options(sell_ex,base)
+    if not w or not d:
+        return None
+    dep={x["key"]:x for x in d}
+    choices=[]
+    for item in w:
+        other=dep.get(item["key"])
+        if other is None:
+            continue
+        fee_coin=item["fee_coin"]
+        choices.append({
+            "network":item["name"],
+            "fee_coin":fee_coin,
+            "fee_usdt":fee_coin*price,
+            "min_withdraw":item["min"],
+        })
+    return min(choices,key=lambda z:z["fee_usdt"]) if choices else None
+
+def depth(bb,sb,bf,sf,capital,minnet,transfer_fee=0.0):
     def lv(raw):
         return [(n(a[0]),n(a[1])) for a in (raw or []) if isinstance(a,(list,tuple)) and len(a)>=2 and n(a[0])>0 and n(a[1])>0]
     asks=sorted(lv(bb.get("asks",[])));bids=sorted(lv(sb.get("bids",[])),reverse=True)
@@ -419,7 +534,7 @@ def depth(bb,sb,bf,sf,capital,minnet):
             bi+=1
             if bi<len(bids):br=bids[bi][1]
     if qty<=0 or cost<=0:return None
-    profit=sell*(1-sf)-cost*(1+bf);net=profit/cost*100
+    profit=sell*(1-sf)-cost*(1+bf)-transfer_fee;net=profit/cost*100
     if net<minnet:return None
     return {"qty":qty,"cost":cost,"sell":sell,"avg_buy":cost/qty,"avg_sell":sell/qty,"top_buy":asks[0][0],"top_sell":bids[0][0],"top_gross":(bids[0][0]/asks[0][0]-1)*100,"net":net,"profit":profit,"fees":cost*bf+sell*sf}
 
@@ -506,15 +621,33 @@ class Worker(QObject):
 
                 cs = verified
 
-            cs=[
-                item for item in cs
-                if item[0] <= self.maxnet
-            ][:self.limit]
+            cs=[item for item in cs if item[0] <= self.maxnet]
+
+            # Transfer is mandatory: BUY spot -> withdraw -> deposit -> SELL margin.
+            transfer_verified=[]
+            with ThreadPoolExecutor(max_workers=min(8,max(1,len(cs)))) as tp:
+                tf={}
+                for item in cs:
+                    _,bs,ss,be,se,_=item
+                    base=str((m[be][bs].get("market") or {}).get("base") or bs.split("/")[0]).upper()
+                    buy_price=n(m[be][bs].get("ask"))
+                    tf[tp.submit(best_transfer,be,se,base,buy_price)]=item
+                for f in as_completed(tf):
+                    if self.stop_requested:
+                        for q in tf:q.cancel()
+                        self.done.emit([],self.status(m,len(cs)));return
+                    item=tf[f]
+                    try: tr=f.result()
+                    except Exception: tr=None
+                    if tr is not None:
+                        transfer_verified.append(item+(tr,))
+            cs=transfer_verified[:self.limit]
 
             books={}
             with ThreadPoolExecutor(max_workers=10) as p:
                 fs={}
-                for _,bs,ss,be,se,_ in cs:
+                for item in cs:
+                    _,bs,ss,be,se,_,transfer=item
                     k=(bs,ss,be,se);fs[p.submit(book,be,bs)]=(k,"buy");fs[p.submit(book,se,ss)]=(k,"sell")
                 for f in as_completed(fs):
                     if self.stop_requested:
@@ -524,12 +657,15 @@ class Worker(QObject):
                     try:books.setdefault(k,{})[side]=f.result()
                     except:pass
             rows=[]
-            for _,bs,ss,be,se,_ in cs:
+            for item in cs:
+                _,bs,ss,be,se,_,transfer=item
                 if self.stop_requested:self.done.emit([],self.status(m,len(cs)));return
                 k=(bs,ss,be,se);b=books.get(k,{})
                 if "buy" not in b or "sell" not in b:continue
-                r=depth(b["buy"],b["sell"],self.fees[be],self.fees[se],self.capital,self.minnet)
-                if r:r.update(symbol=bs,sell_symbol=ss,buy=be,sell=se);rows.append(r)
+                r=depth(b["buy"],b["sell"],self.fees[be],self.fees[se],self.capital,self.minnet,transfer["fee_usdt"])
+                if r:
+                    r.update(symbol=bs,sell_symbol=ss,buy=be,sell=se,network=transfer["network"],transfer_fee=transfer["fee_usdt"],transfer_fee_coin=transfer["fee_coin"])
+                    rows.append(r)
             rows.sort(key=lambda x:x["profit"],reverse=True);self.done.emit(rows,self.status(m,len(cs)))
         except Exception as e:
             if not self.stop_requested:self.err.emit(f"{type(e).__name__}: {e}")
@@ -614,9 +750,9 @@ class ExchangeManager(QDialog):
 
 class App(QMainWindow):
     def __init__(self):
-        super().__init__();self.setWindowTitle("Arbitrage Client 0.9.4");self.resize(1450,800);self.th=None;self.w=None;self.running=False
+        super().__init__();self.setWindowTitle("Arbitrage Client 0.10.0");self.resize(1450,800);self.th=None;self.w=None;self.running=False
         self.build_menu()
-        root=QWidget();self.setCentralWidget(root);v=QVBoxLayout(root);h=QLabel("ARBITRAGE CLIENT 0.9");h.setStyleSheet("font-size:26px;font-weight:bold;");v.addWidget(h);v.addWidget(QLabel("Spot arbitrage scanner: BYBIT ↔ OKX ↔ BITGET with optional SELL-side margin/borrow filter."))
+        root=QWidget();self.setCentralWidget(root);v=QVBoxLayout(root);h=QLabel("ARBITRAGE CLIENT 0.10");h.setStyleSheet("font-size:26px;font-weight:bold;");v.addWidget(h);v.addWidget(QLabel("Spot arbitrage scanner: BUY Spot → Withdraw → Deposit → SELL Margin."))
         g=QGroupBox("Exchanges");gl=QVBoxLayout(g);self.ex_widgets={}
         for e in EXCHANGES:
             self.ex_widgets[e]=Ex(e,self)
@@ -650,7 +786,7 @@ class App(QMainWindow):
         v.addWidget(g);c=QHBoxLayout();self.start=QPushButton("▶ Start scanner");self.start.clicked.connect(self.toggle);c.addWidget(self.start)
         for t,f in [("Refresh now",self.scan),("Refresh balances",self.balances)]:b=QPushButton(t);b.clicked.connect(f);c.addWidget(b)
         c.addStretch();self.status=QLabel("Ready");c.addWidget(self.status);v.addLayout(c)
-        self.tab=QTableWidget(0,14);self.tab.setHorizontalHeaderLabels(["Coin BUY","Coin SELL","BUY","SELL","Top buy","Top sell","Avg buy","Avg sell","Top gross %","Real net %","Qty","Notional","Profit","Fees"]);self.tab.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch);v.addWidget(self.tab)
+        self.tab=QTableWidget(0,16);self.tab.setHorizontalHeaderLabels(["Coin BUY","Coin SELL","BUY","SELL","Network","Withdraw fee","Top buy","Top sell","Avg buy","Avg sell","Top gross %","Real net %","Qty","Notional","Profit","Fees"]);self.tab.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch);v.addWidget(self.tab)
         g=QGroupBox("USDT Spot Balance");bl=QHBoxLayout(g);self.balance_labels={}
         for e in EXCHANGES:self.balance_labels[e]=QLabel(e.upper()+": —");bl.addWidget(self.balance_labels[e])
         bl.addStretch();v.addWidget(g);self.timer=QTimer();self.timer.timeout.connect(self.scan)
@@ -718,7 +854,7 @@ class App(QMainWindow):
         if not self.running:self.status.setText("Stopped");return
         self.tab.setRowCount(len(rows))
         for i,r in enumerate(rows):
-            vals=[r["symbol"],r["sell_symbol"],r["buy"].upper(),r["sell"].upper(),f'{r["top_buy"]:,.8g}',f'{r["top_sell"]:,.8g}',f'{r["avg_buy"]:,.8g}',f'{r["avg_sell"]:,.8g}',f'{r["top_gross"]:.4f}%',f'{r["net"]:.4f}%',f'{r["qty"]:,.8g}',f'${r["cost"]:,.2f}',f'${r["profit"]:,.4f}',f'${r["fees"]:,.4f}']
+            vals=[r["symbol"],r["sell_symbol"],r["buy"].upper(),r["sell"].upper(),r.get("network",""),f'${r.get("transfer_fee",0):,.4f}',f'{r["top_buy"]:,.8g}',f'{r["top_sell"]:,.8g}',f'{r["avg_buy"]:,.8g}',f'{r["avg_sell"]:,.8g}',f'{r["top_gross"]:.4f}%',f'{r["net"]:.4f}%',f'{r["qty"]:,.8g}',f'${r["cost"]:,.2f}',f'${r["profit"]:,.4f}',f'${r["fees"]:,.4f}']
             for j,x in enumerate(vals):self.tab.setItem(i,j,QTableWidgetItem(x))
         self.status.setText(
             f'OK: Bybit {st["bybit"]} | OKX {st["okx"]} | '
