@@ -182,84 +182,182 @@ def identity(m):
 
 def margin_info(ex):
     """
-    Return a set of base assets that can be borrowed for spot-margin selling.
+    Return a conservative set of USDT spot pairs whose BASE coin can be
+    borrowed for a SELL-side margin trade.
 
-    This is intentionally conservative:
-    - We first inspect CCXT margin markets.
-    - Then, where possible, inspect exchange-specific market metadata.
-    - If an exchange/API does not expose reliable borrowability information,
-      the asset is NOT considered margin-sellable.
-
-    The scanner therefore avoids presenting a false "borrow available" result.
+    Exchange-specific APIs are used. Generic CCXT market flags are not used
+    as proof of borrowability because a normal spot market can exist without
+    margin support.
     """
     x = make(ex)
     x.load_markets()
     result = set()
 
-    for symbol, m in x.markets.items():
-        if not isinstance(symbol, str):
-            continue
-        if m.get("quote") != "USDT":
-            continue
-        if m.get("spot") is not True:
-            continue
-
-        # CCXT flags / market type.
-        is_margin = bool(
-            m.get("margin")
-            or m.get("marginMode")
-            or m.get("marginModes")
-            or m.get("type") in ("margin", "spotMargin")
-        )
-
-        info = m.get("info") or {}
-        info_text = " ".join(
-            txt(v) for v in info.values()
-            if isinstance(v, (str, int, float, bool))
-        )
-
-        # Exchange metadata frequently contains an explicit borrow flag.
-        borrow_flag = None
-        for key in (
-            "borrowable", "borrowAble", "borrowableBase",
-            "baseBorrowable", "canBorrow", "enableBorrow",
-            "isBorrowable", "borrowEnabled"
-        ):
-            if key in m:
-                borrow_flag = m.get(key)
-                break
-            if key in info:
-                borrow_flag = info.get(key)
-                break
-
-        if borrow_flag is not None:
-            ok = str(borrow_flag).lower() in (
-                "true", "1", "yes", "y", "enabled", "enable"
-            )
-            if ok:
-                result.add(m.get("base") or symbol.split("/")[0])
-            continue
-
-        # If CCXT explicitly says margin is supported, accept it as a
-        # provisional borrowable candidate. The actual borrow request is
-        # NOT performed by this read-only scanner.
-        if is_margin:
-            result.add(m.get("base") or symbol.split("/")[0])
-
-    # Exchange-specific fallback: some CCXT market structures expose
-    # margin pairs via type but not the top-level margin flag.
-    if not result:
-        for symbol, m in x.markets.items():
-            if not isinstance(symbol, str) or m.get("quote") != "USDT":
+    if ex == "bitget":
+        # Bitget's authoritative margin-currency endpoint exposes both the
+        # supported USDT pair and whether the BASE coin is borrowable in
+        # isolated/cross margin.
+        fn = getattr(x, "privateGetV2MarginCurrencies", None)
+        if fn is None:
+            raise RuntimeError("Bitget margin API is unavailable in this CCXT version")
+        resp = fn()
+        data = resp.get("data", []) if isinstance(resp, dict) else []
+        for item in data:
+            if not isinstance(item, dict):
                 continue
-            if m.get("spot") is not True:
+            if str(item.get("quoteCoin", "")).upper() != "USDT":
                 continue
-            info = m.get("info") or {}
-            text = " ".join(txt(v) for v in info.values())
-            if any(k in text for k in ("borrowable", "borrowablebase", "borrowable_base")):
-                result.add(m.get("base") or symbol.split("/")[0])
+            if str(item.get("status", "1")) != "1":
+                continue
+            base = str(item.get("baseCoin", "")).upper()
+            if not base:
+                continue
+            if item.get("isIsolatedBaseBorrowable") is True or item.get("isCrossBorrowable") is True:
+                result.add(base)
+        return result
 
-    return {txt(x) for x in result if x}
+    if ex == "okx":
+        # OKX exposes MARGIN instruments separately from SPOT instruments.
+        # We use the public instrument list first, then verify that the
+        # account can actually obtain a BASE-currency loan for SELL.
+        pub = getattr(x, "publicGetApiV5PublicInstruments", None)
+        loan = getattr(x, "privateGetApiV5AccountMaxLoan", None)
+        if pub is None or loan is None:
+            raise RuntimeError("OKX margin API is unavailable in this CCXT version")
+
+        resp = pub({"instType": "MARGIN"})
+        data = resp.get("data", []) if isinstance(resp, dict) else []
+        margin_symbols = set()
+
+        for item in data:
+            if not isinstance(item, dict):
+                continue
+            if item.get("state") not in (None, "", "live"):
+                continue
+            inst = str(item.get("instId", ""))
+            if inst.endswith("-USDT"):
+                margin_symbols.add(inst)
+
+        # We only need to verify the currencies that are actually present
+        # in the margin instrument list. The full check is done lazily by
+        # margin_sellable_exact() for candidate pairs.
+        for inst in margin_symbols:
+            base = inst.split("-")[0].upper()
+            result.add(base)
+        return result
+
+    if ex == "bybit":
+        # Bybit's spot instrument metadata has an explicit marginTrading
+        # field. This is a useful first-stage pair filter.
+        pub = getattr(x, "publicGetV5MarketInstrumentsInfo", None)
+        if pub is None:
+            raise RuntimeError("Bybit margin API is unavailable in this CCXT version")
+
+        resp = pub({"category": "spot", "limit": 1000})
+        data = (resp.get("result") or {}).get("list", []) if isinstance(resp, dict) else []
+
+        for item in data:
+            if not isinstance(item, dict):
+                continue
+            if str(item.get("symbol", "")).endswith("USDT"):
+                mt = str(item.get("marginTrading", "")).lower()
+                if mt in ("both", "utaonly", "utamargin", "1", "true"):
+                    base = str(item.get("baseCoin", "")).upper()
+                    if base:
+                        result.add(base)
+
+        return result
+
+    return result
+
+
+def margin_sellable_exact(ex, symbol):
+    """
+    Verify the SELL-side borrowability for one concrete USDT pair.
+
+    Returns:
+        (True, max_borrowable_base) when a positive BASE borrow is available.
+        (False, 0.0) otherwise.
+
+    This is deliberately account-aware. A pair being listed as margin-capable
+    is not enough if the current account/pool cannot borrow the base coin.
+    """
+    x = make(ex)
+    base = str((x.markets.get(symbol) or {}).get("base") or symbol.split("/")[0]).upper()
+    quote = str((x.markets.get(symbol) or {}).get("quote") or "USDT").upper()
+
+    if quote != "USDT" or not base:
+        return False, 0.0
+
+    if ex == "bitget":
+        fn = getattr(x, "privateGetV2MarginIsolatedAccountMaxBorrowableAmount", None)
+        if fn is not None:
+            raw = fn({"symbol": symbol.replace("/", "").replace("-", "")})
+            data = raw.get("data") if isinstance(raw, dict) else None
+            if isinstance(data, dict):
+                amount = n(data.get("baseCoinMaxBorrowAmount"))
+                if amount > 0:
+                    return True, amount
+
+        # If the exact max-borrow endpoint is unavailable, fall back to the
+        # authoritative support-currencies flags. This can prove capability,
+        # but not current pool quantity.
+        support = margin_info("bitget")
+        return (base in support), 0.0
+
+    if ex == "okx":
+        fn = getattr(x, "privateGetApiV5AccountMaxLoan", None)
+        if fn is None:
+            return False, 0.0
+
+        inst = symbol.replace("/", "-")
+        best = 0.0
+
+        # In OKX spot margin, SELL of BTC-USDT borrows BTC. Check both
+        # isolated and cross because either mode can support the strategy.
+        for mode in ("isolated", "cross"):
+            try:
+                raw = fn({"instId": inst, "mgnMode": mode})
+                data = raw.get("data", []) if isinstance(raw, dict) else []
+                for item in data:
+                    if not isinstance(item, dict):
+                        continue
+                    if str(item.get("ccy", "")).upper() != base:
+                        continue
+                    if str(item.get("side", "")).lower() != "sell":
+                        continue
+                    best = max(best, n(item.get("maxLoan")))
+            except Exception:
+                continue
+
+        return best > 0, best
+
+    if ex == "bybit":
+        fn = getattr(x, "privateGetV5OrderSpotBorrowCheck", None)
+        if fn is None:
+            return False, 0.0
+
+        # Bybit explicitly returns borrowCoin and maxTradeQty for Spot
+        # margin. We compare it with the actual spot-only quantity.
+        sym = symbol.replace("/", "").replace("-", "").upper()
+        try:
+            raw = fn({"category": "spot", "symbol": sym, "side": "Sell"})
+            data = (raw.get("result") or {}) if isinstance(raw, dict) else {}
+
+            borrow_coin = str(data.get("borrowCoin") or "").upper()
+            max_qty = n(data.get("maxTradeQty"))
+            spot_qty = n(data.get("spotMaxTradeQty"))
+
+            if borrow_coin == base:
+                extra = max(0.0, max_qty - spot_qty)
+                if extra > 0:
+                    return True, extra
+        except Exception:
+            pass
+
+        return False, 0.0
+
+    return False, 0.0
 
 
 def margin_sellable(ex, base):
@@ -377,11 +475,36 @@ class Worker(QObject):
             cs=candidates(m,self.fees,self.minnet,self.enabled)
 
             if self.require_margin:
-                cs=[
+                rough = [
                     item for item in cs
-                    if txt(m[item[3]][item[1]].get("market",{}).get("base") or item[1].split("/")[0])
+                    if txt(m[item[3]][item[1]].get("market",{}).get("base") or item[1].split("/")[0]).upper()
                     in self.margin_assets.get(item[4],set())
                 ]
+
+                # Exact, account-aware SELL-side borrow check. We do this
+                # only for candidate pairs, not for every listed asset.
+                verified = []
+                with ThreadPoolExecutor(max_workers=min(5, max(1, len(rough)))) as vp:
+                    vf = {}
+                    for item in rough:
+                        _, _, ss, _, se, _ = item
+                        vf[vp.submit(margin_sellable_exact, se, ss)] = item
+
+                    for f in as_completed(vf):
+                        if self.stop_requested:
+                            for q in vf:
+                                q.cancel()
+                            self.done.emit([], self.status(m, 0))
+                            return
+                        item = vf[f]
+                        try:
+                            ok, max_borrow = f.result()
+                        except Exception:
+                            ok, max_borrow = False, 0.0
+                        if ok:
+                            verified.append(item)
+
+                cs = verified
 
             cs=[
                 item for item in cs
@@ -491,7 +614,7 @@ class ExchangeManager(QDialog):
 
 class App(QMainWindow):
     def __init__(self):
-        super().__init__();self.setWindowTitle("Arbitrage Client 0.9");self.resize(1450,800);self.th=None;self.w=None;self.running=False
+        super().__init__();self.setWindowTitle("Arbitrage Client 0.9.4");self.resize(1450,800);self.th=None;self.w=None;self.running=False
         self.build_menu()
         root=QWidget();self.setCentralWidget(root);v=QVBoxLayout(root);h=QLabel("ARBITRAGE CLIENT 0.9");h.setStyleSheet("font-size:26px;font-weight:bold;");v.addWidget(h);v.addWidget(QLabel("Spot arbitrage scanner: BYBIT ↔ OKX ↔ BITGET with optional SELL-side margin/borrow filter."))
         g=QGroupBox("Exchanges");gl=QVBoxLayout(g);self.ex_widgets={}
