@@ -450,9 +450,12 @@ def transfer_options(ex, base):
             active=d.get("active")
             fee=n(d.get("fee"))
             key=_network_key(name,d)
-            if not key or w is not True:
+            if not key:
                 continue
-            if active is False:
+            # CCXT may return None for a capability that the exchange
+            # supports but does not expose in the unified response.
+            # Reject only an explicit False.
+            if w is False or active is False:
                 continue
             out.append({
                 "key":key,
@@ -480,9 +483,11 @@ def deposit_options(ex, base):
             dep=d.get("deposit")
             active=d.get("active")
             key=_network_key(name,d)
-            if not key or dep is not True:
+            if not key:
                 continue
-            if active is False:
+            # Same rule: explicit False means unavailable; None is unknown
+            # and is allowed to be matched with an enabled withdrawal network.
+            if dep is False or active is False:
                 continue
             out.append({"key":key,"name":str(name)})
         return out
@@ -551,6 +556,7 @@ class Worker(QObject):
         self.require_margin=require_margin
         self.stop_requested=False
         self.margin_assets={}
+        self.transfer_candidate_count=0
     def stop(self):self.stop_requested=True
     def status(self,m,c):
         sets=[set(m.get(e,{})) for e in self.enabled if m.get(e)]
@@ -560,6 +566,7 @@ class Worker(QObject):
             "bitget": len(m.get("bitget", {})),
             "common": len(set.intersection(*sets)) if len(sets) >= 2 else 0,
             "checked": c,
+            "transfer_candidates": getattr(self, "transfer_candidate_count", 0),
             "identified": sum(
                 1 for ex in self.enabled
                 for d in m.get(ex, {}).values()
@@ -642,6 +649,7 @@ class Worker(QObject):
                     if tr is not None:
                         transfer_verified.append(item+(tr,))
             cs=transfer_verified[:self.limit]
+            self.transfer_candidate_count=len(cs)
 
             books={}
             with ThreadPoolExecutor(max_workers=10) as p:
