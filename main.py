@@ -37,12 +37,19 @@ def tickers(ex):
     x=make(ex); x.load_markets()
     d=x.fetch_tickers(params={"category":"spot"}) if ex=="bybit" else x.fetch_tickers()
     out={}
-    for s,t in d.items():
-        if not s.endswith("/USDT") or s not in x.markets: continue
+    # CCXT normally returns a dict here, but some exchange responses can
+    # contain list-like structures. Handle both safely.
+    items = d.items() if hasattr(d, "items") else []
+    for s,t in items:
+        if not isinstance(s, str) or not s.endswith("/USDT") or s not in x.markets:
+            continue
         m=x.markets[s]
-        if m.get("active") is False or m.get("spot") is not True: continue
-        bid,ask=n(t.get("bid")),n(t.get("ask"))
-        if bid>0 and ask>0: out[s]={"bid":bid,"ask":ask}
+        if m.get("active") is False or m.get("spot") is not True:
+            continue
+        bid = n(t.get("bid")) if isinstance(t, dict) else 0
+        ask = n(t.get("ask")) if isinstance(t, dict) else 0
+        if bid>0 and ask>0:
+            out[s]={"bid":bid,"ask":ask}
     return out
 
 def candidates(a,b,bf,of,minnet):
@@ -64,8 +71,21 @@ def book(ex,symbol):
     return x.fetch_order_book(symbol,limit=50,params={"category":"spot"}) if ex=="bybit" else x.fetch_order_book(symbol,limit=50)
 
 def depth(buybook,sellbook,bf,sf,capital,minnet):
-    asks=sorted([(n(p),n(q)) for p,q in buybook.get("asks",[]) if n(p)>0 and n(q)>0])
-    bids=sorted([(n(p),n(q)) for p,q in sellbook.get("bids",[]) if n(p)>0 and n(q)>0],reverse=True)
+    # Some exchange/order-book implementations may append extra fields
+    # to a level. We only need price and amount, so use indexes instead
+    # of "for p, q in ..." unpacking.
+    def levels(raw):
+        out=[]
+        for level in (raw or []):
+            if not isinstance(level, (list, tuple)) or len(level) < 2:
+                continue
+            p=n(level[0]); q=n(level[1])
+            if p>0 and q>0:
+                out.append((p,q))
+        return out
+
+    asks=sorted(levels(buybook.get("asks",[])))
+    bids=sorted(levels(sellbook.get("bids",[])),reverse=True)
     if not asks or not bids:return None
     ai=bi=0; ar=asks[0][1]; br=bids[0][1]
     qty=cost=sell=0.0
