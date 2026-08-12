@@ -242,63 +242,83 @@ class Worker(QObject):
         self.capital = capital
         self.minnet = minnet
         self.limit = limit
+        self.stop_requested = False
+
+    def stop(self):
+        self.stop_requested = True
 
     def run(self):
         try:
+            if self.stop_requested:
+                self.done.emit([], {"bybit":0,"okx":0,"bitget":0,"common":0,"checked":0})
+                return
+
             markets = {}
 
-            # Fetch all three exchanges in parallel.
             with ThreadPoolExecutor(3) as p:
                 fs = {p.submit(tickers, ex): ex for ex in EXCHANGES}
-
                 for f in as_completed(fs):
+                    if self.stop_requested:
+                        for pending in fs:
+                            if not pending.done():
+                                pending.cancel()
+                        self.done.emit([], {"bybit":0,"okx":0,"bitget":0,"common":0,"checked":0})
+                        return
                     ex = fs[f]
                     markets[ex] = f.result()
 
             for ex in EXCHANGES:
                 markets.setdefault(ex, {})
 
-            cs = pair_candidates(markets, self.fees, self.minnet)
+            if self.stop_requested:
+                self.done.emit([], {"bybit":len(markets["bybit"]),"okx":len(markets["okx"]),"bitget":len(markets["bitget"]),"common":0,"checked":0})
+                return
 
-            # Limit expensive order-book requests.
+            cs = pair_candidates(markets, self.fees, self.minnet)
             cs = cs[:self.limit]
 
             books = {}
 
-            # Two order-book requests per opportunity.
             with ThreadPoolExecutor(10) as p:
                 fs = {}
-
                 for _, symbol, buy, sell in cs:
                     key = (symbol, buy, sell)
-
                     fs[p.submit(book, buy, symbol)] = (key, "buy")
                     fs[p.submit(book, sell, symbol)] = (key, "sell")
 
                 for f in as_completed(fs):
+                    if self.stop_requested:
+                        for pending in fs:
+                            if not pending.done():
+                                pending.cancel()
+                        self.done.emit([], {"bybit":len(markets["bybit"]),"okx":len(markets["okx"]),"bitget":len(markets["bitget"]),"common":0,"checked":len(cs)})
+                        return
                     key, side = fs[f]
                     try:
                         books.setdefault(key, {})[side] = f.result()
                     except Exception:
-                        # A single bad/unsupported market must not kill the scan.
                         pass
+
+            if self.stop_requested:
+                self.done.emit([], {"bybit":len(markets["bybit"]),"okx":len(markets["okx"]),"bitget":len(markets["bitget"]),"common":0,"checked":len(cs)})
+                return
 
             rows = []
 
             for _, symbol, buy, sell in cs:
+                if self.stop_requested:
+                    self.done.emit([], {"bybit":len(markets["bybit"]),"okx":len(markets["okx"]),"bitget":len(markets["bitget"]),"common":0,"checked":len(cs)})
+                    return
+
                 key = (symbol, buy, sell)
                 bb = books.get(key, {})
-
                 if "buy" not in bb or "sell" not in bb:
                     continue
 
                 r = depth(
-                    bb["buy"],
-                    bb["sell"],
-                    self.fees[buy],
-                    self.fees[sell],
-                    self.capital,
-                    self.minnet
+                    bb["buy"], bb["sell"],
+                    self.fees[buy], self.fees[sell],
+                    self.capital, self.minnet
                 )
 
                 if r:
@@ -311,18 +331,18 @@ class Worker(QObject):
                 "bybit": len(markets["bybit"]),
                 "okx": len(markets["okx"]),
                 "bitget": len(markets["bitget"]),
-                "common": (
-                    len(set(markets["bybit"]) &
-                        set(markets["okx"]) &
-                        set(markets["bitget"]))
-                ),
+                "common": len(set(markets["bybit"]) & set(markets["okx"]) & set(markets["bitget"])),
                 "checked": len(cs),
             }
 
             self.done.emit(rows, status)
 
         except Exception as e:
-            self.err.emit(f"{type(e).__name__}: {e}")
+            if not self.stop_requested:
+                self.err.emit(f"{type(e).__name__}: {e}")
+            else:
+                self.done.emit([], {"bybit":0,"okx":0,"bitget":0,"common":0,"checked":0})
+
 
 
 class Api(QDialog):
@@ -585,16 +605,21 @@ class App(QMainWindow):
                 label.setText(f"{ex.upper()}: error")
 
     def toggle(self):
-        self.running = not self.running
-
         if self.running:
-            self.start.setText("■ Stop scanner")
-            self.scan()
-            self.timer.start(self.sec.value() * 1000)
-        else:
-            self.start.setText("▶ Start scanner")
+            self.running = False
             self.timer.stop()
-            self.status.setText("Stopped")
+            self.start.setText("▶ Start scanner")
+
+            if self.w is not None:
+                self.w.stop()
+
+            self.status.setText("Stopping…")
+            return
+
+        self.running = True
+        self.start.setText("■ Stop scanner")
+        self.scan()
+        self.timer.start(self.sec.value() * 1000)
 
     def scan(self):
         if self.th and self.th.isRunning():
